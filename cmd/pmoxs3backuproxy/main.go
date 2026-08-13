@@ -54,6 +54,63 @@ import (
 var connectionList = make(map[string]*minio.Client)
 var writer_mux sync.RWMutex
 
+// chunkUploadMutex serialises uploads that target the SAME object key.
+//
+// Uploading a chunk is a check-then-act sequence: StatObject() reports
+// NoSuchKey, then PutObject() writes it. A backup stream regularly contains
+// the SAME chunk twice (all-zero blocks, reinitialised regions), and the
+// client uploads chunks concurrently, so two requests can both observe
+// NoSuchKey and then PUT the same key at the same time.
+//
+// Some S3 implementations reject that with "A conflicting conditional
+// operation is currently in progress against this resource" (observed on OVH
+// Object Storage), which failed the chunk and aborted the whole backup.
+// Serialising per key removes the race: the second request finds the object
+// present and takes the already-known path instead of writing again.
+//
+// Entries are reference counted, so the map cannot grow unbounded.
+type keyedMutex struct {
+	mu      sync.Mutex
+	entries map[string]*keyedMutexEntry
+}
+
+type keyedMutexEntry struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// Lock blocks until the key is free and returns the matching unlock function.
+func (k *keyedMutex) Lock(key string) func() {
+	k.mu.Lock()
+	if k.entries == nil {
+		k.entries = make(map[string]*keyedMutexEntry)
+	}
+	e, ok := k.entries[key]
+	if !ok {
+		e = &keyedMutexEntry{}
+		k.entries[key] = e
+	}
+	e.refs++
+	k.mu.Unlock()
+
+	e.mu.Lock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			e.mu.Unlock()
+			k.mu.Lock()
+			e.refs--
+			if e.refs == 0 {
+				delete(k.entries, key)
+			}
+			k.mu.Unlock()
+		})
+	}
+}
+
+var chunkUploadMutex keyedMutex
+
 const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 var (
@@ -951,40 +1008,56 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		var known bool = false
 
-		objectStat, e := s.H2Ticket.Client.StatObject(
-			context.Background(),
-			*s.SelectedDataStore,
-			s3name,
-			minio.StatObjectOptions{},
-		)
-		if e != nil {
-			errResponse := minio.ToErrorResponse(e)
-			switch errResponse.Code {
-			case "NoSuchKey":
-				_, err := s.H2Ticket.Client.PutObject(
-					context.Background(),
-					*s.SelectedDataStore,
-					s3name,
-					r.Body,
-					int64(esize),
-					minio.PutObjectOptions{},
-				)
-				if err != nil {
-					s3backuplog.ErrorPrint("Writing object %s failed: %s", digest, err.Error())
-					w.WriteHeader(http.StatusInternalServerError)
-					w.Write([]byte(err.Error()))
+		// The whole check-then-act runs under a per-key lock, released by defer
+		// so that a panic inside the S3 client cannot leave the key locked
+		// forever (net/http recovers panics per connection).
+		uploadErr := func() error {
+			defer chunkUploadMutex.Lock(*s.SelectedDataStore + "/" + s3name)()
+
+			objectStat, e := s.H2Ticket.Client.StatObject(
+				context.Background(),
+				*s.SelectedDataStore,
+				s3name,
+				minio.StatObjectOptions{},
+			)
+			if e != nil {
+				errResponse := minio.ToErrorResponse(e)
+				switch errResponse.Code {
+				case "NoSuchKey":
+					_, err := s.H2Ticket.Client.PutObject(
+						context.Background(),
+						*s.SelectedDataStore,
+						s3name,
+						r.Body,
+						int64(esize),
+						minio.PutObjectOptions{},
+					)
+					if err != nil {
+						return err
+					}
+				default:
+					s3backuplog.WarnPrint("Unhandled response checking for existent object: %s", errResponse.Code)
 				}
-			default:
-				s3backuplog.WarnPrint("Unhandled response checking for existent object: %s", errResponse.Code)
+			} else {
+				s3backuplog.DebugPrint("%s already in S3, size: %d", objectStat.Key, objectStat.Size)
+				/*
+				 * If an object already exists, we must read the data sent by the
+				 * backup client, otherwise it will get out of sync.
+				 */
+				io.Copy(io.Discard, r.Body)
+				known = true
 			}
-		} else {
-			s3backuplog.DebugPrint("%s already in S3, size: %d", objectStat.Key, objectStat.Size)
-			/*
-			 * If an object already exists, we must read the data sent by the
-			 * backup client, otherwise it will get out of sync.
-			 */
-			io.Copy(io.Discard, r.Body)
-			known = true
+			return nil
+		}()
+
+		if uploadErr != nil {
+			s3backuplog.ErrorPrint("Writing object %s failed: %s", digest, uploadErr.Error())
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(uploadErr.Error()))
+			// Without this return the handler carried on and emitted a second
+			// WriteHeader(200) plus a success payload for a chunk that was
+			// never written.
+			return
 		}
 		if s.Writers[int32(wid)].Chunksize == 0 {
 			//Here chunk size is derived
