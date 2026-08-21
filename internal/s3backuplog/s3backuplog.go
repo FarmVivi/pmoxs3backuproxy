@@ -1,37 +1,45 @@
 package s3backuplog
 
 import (
+	"io"
 	"log"
 	"os"
+	"sync/atomic"
 )
 
-var flags = log.Ldate | log.Lshortfile
-var logger = log.New(os.Stdout, "", flags)
-var Gdebug = false
+var logger = log.New(os.Stdout, "", log.Ldate|log.Ltime|log.Lmicroseconds)
+var debugEnabled atomic.Bool
 
 func EnableDebug() {
-	Gdebug = true
-	log.SetFlags(log.Ldate | log.Lmicroseconds)
+	debugEnabled.Store(true)
 }
 
-func DebugPrint(fmt string, args ...interface{}) {
-	if Gdebug {
-		log.Printf("[\033[34;1m DEBUG \033[0m] "+fmt, args...)
+func DebugPrint(format string, args ...interface{}) {
+	if debugEnabled.Load() {
+		logger.Printf("[DEBUG] "+format, args...)
 	}
 }
 
-func InfoPrint(fmt string, args ...interface{}) {
-	log.Printf("[\033[37;1m  INFO \033[0m] "+fmt, args...)
+func InfoPrint(format string, args ...interface{}) {
+	logger.Printf("[INFO] "+format, args...)
 }
 
-func ErrorPrint(fmt string, args ...interface{}) {
-	log.Printf("[\033[31;1m ERROR \033[0m] "+fmt, args...)
+func ErrorPrint(format string, args ...interface{}) {
+	logger.Printf("[ERROR] "+format, args...)
 }
 
-func WarnPrint(fmt string, args ...interface{}) {
-	log.Printf("[\033[33;1mWARNING\033[0m] "+fmt, args...)
+func WarnPrint(format string, args ...interface{}) {
+	logger.Printf("[WARNING] "+format, args...)
 }
 
-func FatalPrint(fmt string, args ...interface{}) {
-	log.Fatalf("[\033[31;1m FATAL \033[0m] "+fmt, args...)
+func FatalPrint(format string, args ...interface{}) {
+	logger.Fatalf("[FATAL] "+format, args...)
+}
+
+// SetOutput redirects logs and returns a restore function. It is primarily
+// useful to embedders and tests; log.Logger itself remains concurrency-safe.
+func SetOutput(w io.Writer) func() {
+	previous := logger.Writer()
+	logger.SetOutput(w)
+	return func() { logger.SetOutput(previous) }
 }
