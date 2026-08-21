@@ -111,6 +111,21 @@ func (k *keyedMutex) Lock(key string) func() {
 
 var chunkUploadMutex keyedMutex
 
+// bucketListCache backs GET /api2/json/admin/datastore.
+//
+// PVE calls that endpoint to activate the storage, and it is on the critical
+// path of every backup job: PVE::Storage::PBSPlugin::activate_storage lists
+// the datastores and aborts the job when the call does not answer within the
+// 7 second timeout hardcoded in pbs_api_connect. Before this cache every call
+// - including the pvestatd poll that happens every 10 seconds - performed a
+// ListBuckets round trip to the object store, so a transient slowdown of the
+// endpoint was enough to fail a whole night of backups with
+// "could not activate storage - 500 read timeout".
+//
+// The list of buckets of an account changes on human timescales, so a short
+// TTL plus serve-stale-on-error removes that failure mode entirely.
+var bucketListCache *ttlCache[[]minio.BucketInfo]
+
 const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 var (
@@ -178,6 +193,10 @@ func main() {
 	insecureFlag := flag.Bool("usessl", false, "Use SSL for endpoint connection: default: false")
 	ticketExpireFlag := flag.Uint64("ticketexpire", 3600, "API Ticket expire time in seconds")
 	lookupTypeFlag := flag.String("lookuptype", "auto", "Bucket lookup type: auto,dns,path")
+	bucketCacheTTLFlag := flag.Uint64(
+		"bucketcachettl", 60,
+		"Seconds a datastore (bucket) listing is reused before asking the S3 endpoint again, 0 disables caching",
+	)
 	debug := flag.Bool("debug", false, "Debug logging")
 	flag.BoolVar(&printVersion, "version", false, "Show version and exit")
 	flag.BoolVar(&printVersion, "v", false, "Show version and exit")
@@ -194,6 +213,8 @@ func main() {
 	if *debug {
 		s3backuplog.EnableDebug()
 	}
+
+	bucketListCache = newTTLCache[[]minio.BucketInfo](time.Duration(*bucketCacheTTLFlag) * time.Second)
 
 	S := &Server{
 		S3Endpoint:     *endpointFlag,
@@ -1168,12 +1189,20 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if r.RequestURI == "/api2/json/admin/datastore" && r.Method == "GET" && auth {
 		s3backuplog.DebugPrint("List buckets")
-		bckts, err := C.Client.ListBuckets(context.Background())
+		bckts, fresh, err := bucketListCache.Get(
+			C.AccessKeyID+"@"+C.Endpoint,
+			func() ([]minio.BucketInfo, error) {
+				return C.Client.ListBuckets(context.Background())
+			},
+		)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			s3backuplog.ErrorPrint("Failed to list buckets: %s", err.Error())
 			io.WriteString(w, err.Error())
 			return
+		}
+		if fresh {
+			s3backuplog.DebugPrint("Refreshed bucket list from S3 endpoint")
 		}
 
 		datastores := make([]DataStore, 0)
