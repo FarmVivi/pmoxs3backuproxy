@@ -2,6 +2,7 @@ package main
 
 import (
 	"sync"
+	"time"
 	"tizbac/pmoxs3backuproxy/internal/s3pmoxcommon"
 
 	"github.com/juju/mutex/v2"
@@ -56,6 +57,7 @@ type Server struct {
 	SessionsRelease   mutex.Releaser
 	KnownChunksSizes  sync.Map
 	LookupTypeFlag    string
+	ChunkS3Timeout    time.Duration
 }
 
 type DataStoreStatus struct {

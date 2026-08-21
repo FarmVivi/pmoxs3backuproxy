@@ -53,63 +53,7 @@ import (
 
 var connectionList = make(map[string]*minio.Client)
 var writer_mux sync.RWMutex
-
-// chunkUploadMutex serialises uploads that target the SAME object key.
-//
-// Uploading a chunk is a check-then-act sequence: StatObject() reports
-// NoSuchKey, then PutObject() writes it. A backup stream regularly contains
-// the SAME chunk twice (all-zero blocks, reinitialised regions), and the
-// client uploads chunks concurrently, so two requests can both observe
-// NoSuchKey and then PUT the same key at the same time.
-//
-// Some S3 implementations reject that with "A conflicting conditional
-// operation is currently in progress against this resource" (observed on OVH
-// Object Storage), which failed the chunk and aborted the whole backup.
-// Serialising per key removes the race: the second request finds the object
-// present and takes the already-known path instead of writing again.
-//
-// Entries are reference counted, so the map cannot grow unbounded.
-type keyedMutex struct {
-	mu      sync.Mutex
-	entries map[string]*keyedMutexEntry
-}
-
-type keyedMutexEntry struct {
-	mu   sync.Mutex
-	refs int
-}
-
-// Lock blocks until the key is free and returns the matching unlock function.
-func (k *keyedMutex) Lock(key string) func() {
-	k.mu.Lock()
-	if k.entries == nil {
-		k.entries = make(map[string]*keyedMutexEntry)
-	}
-	e, ok := k.entries[key]
-	if !ok {
-		e = &keyedMutexEntry{}
-		k.entries[key] = e
-	}
-	e.refs++
-	k.mu.Unlock()
-
-	e.mu.Lock()
-
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			e.mu.Unlock()
-			k.mu.Lock()
-			e.refs--
-			if e.refs == 0 {
-				delete(k.entries, key)
-			}
-			k.mu.Unlock()
-		})
-	}
-}
-
-var chunkUploadMutex keyedMutex
+var chunkUploads chunkFlightGroup
 
 // bucketListCache backs GET /api2/json/admin/datastore.
 //
@@ -237,6 +181,10 @@ func main() {
 		"Size reported for a backup: logical (guest disk size), referenced (chunks it points at) or exclusive (chunks only it points at)",
 	)
 	debug := flag.Bool("debug", false, "Debug logging")
+	chunkS3TimeoutFlag := flag.Uint64(
+		"chunks3timeout", 300,
+		"Maximum seconds for one chunk S3 operation, 0 disables the deadline",
+	)
 	flag.BoolVar(&printVersion, "version", false, "Show version and exit")
 	flag.BoolVar(&printVersion, "v", false, "Show version and exit")
 	flag.Parse()
@@ -281,6 +229,7 @@ func main() {
 		SecureFlag:     *insecureFlag,
 		TicketExpire:   *ticketExpireFlag,
 		LookupTypeFlag: *lookupTypeFlag,
+		ChunkS3Timeout: time.Duration(*chunkS3TimeoutFlag) * time.Second,
 	}
 	srv := &http.Server{Addr: *bindAddress, Handler: S}
 	srv.SetKeepAlivesEnabled(true)
@@ -1229,79 +1178,61 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if strings.HasPrefix(r.RequestURI, "/fixed_chunk?") || strings.HasPrefix(r.RequestURI, "/dynamic_chunk?") {
-		esize, _ := strconv.Atoi(r.URL.Query().Get("encoded-size"))
-		size, _ := strconv.ParseUint(r.URL.Query().Get("size"), 10, 64)
-		digest := r.URL.Query().Get("digest")
-		wid, _ := strconv.ParseInt(r.URL.Query().Get("wid"), 10, 32)
-		s3name := fmt.Sprintf("chunks/%s/%s/%s", digest[0:2], digest[2:4], digest[4:])
-
-		var known bool = false
-
-		// The whole check-then-act runs under a per-key lock, released by defer
-		// so that a panic inside the S3 client cannot leave the key locked
-		// forever (net/http recovers panics per connection).
-		uploadErr := func() error {
-			defer chunkUploadMutex.Lock(*s.SelectedDataStore + "/" + s3name)()
-
-			objectStat, e := s.H2Ticket.Client.StatObject(
-				context.Background(),
-				*s.SelectedDataStore,
-				s3name,
-				minio.StatObjectOptions{},
-			)
-			if e != nil {
-				errResponse := minio.ToErrorResponse(e)
-				switch errResponse.Code {
-				case "NoSuchKey":
-					_, err := s.H2Ticket.Client.PutObject(
-						context.Background(),
-						*s.SelectedDataStore,
-						s3name,
-						r.Body,
-						int64(esize),
-						minio.PutObjectOptions{},
-					)
-					if err != nil {
-						return err
-					}
-				default:
-					s3backuplog.WarnPrint("Unhandled response checking for existent object: %s", errResponse.Code)
-				}
-			} else {
-				s3backuplog.DebugPrint("%s already in S3, size: %d", objectStat.Key, objectStat.Size)
-				/*
-				 * If an object already exists, we must read the data sent by the
-				 * backup client, otherwise it will get out of sync.
-				 */
-				io.Copy(io.Discard, r.Body)
-				known = true
-			}
-			return nil
-		}()
-
-		if uploadErr != nil {
-			s3backuplog.ErrorPrint("Writing object %s failed: %s", digest, uploadErr.Error())
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte(uploadErr.Error()))
-			// Without this return the handler carried on and emitted a second
-			// WriteHeader(200) plus a success payload for a chunk that was
-			// never written.
+		if s.H2Ticket == nil || s.H2Ticket.Client == nil || s.SelectedDataStore == nil {
+			http.Error(w, "chunk upload requires an authenticated backup session", http.StatusUnauthorized)
 			return
 		}
-		if s.Writers[int32(wid)].Chunksize == 0 {
-			//Here chunk size is derived
-			s.Writers[int32(wid)].Chunksize = uint64(size)
+		request, err := parseChunkRequest(r)
+		if err != nil {
+			s3backuplog.WarnPrint("Rejected invalid chunk request: %s", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
+		writer_mux.RLock()
+		writer := s.Writers[request.WriterID]
+		writer_mux.RUnlock()
+		if writer == nil {
+			err := fmt.Errorf("unknown writer id %d for chunk %s", request.WriterID, request.Digest)
+			s3backuplog.ErrorPrint("%s", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		ctx := r.Context()
+		if s.ChunkS3Timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, s.ChunkS3Timeout)
+			defer cancel()
+		}
+
+		known, uploadErr := chunkUploads.Do(
+			ctx,
+			*s.SelectedDataStore+"/"+request.ObjectName,
+			func() (bool, error) {
+				return storeChunk(ctx, s.H2Ticket.Client, *s.SelectedDataStore, request, r.Body)
+			},
+			func() error {
+				return drainChunkBody(r.Body, request.EncodedSize)
+			},
+		)
+
+		if uploadErr != nil {
+			s3backuplog.ErrorPrint("Writing object %s failed: %s", request.Digest, uploadErr)
+			http.Error(w, uploadErr.Error(), http.StatusInternalServerError)
+			return
+		}
+		// Here chunk size is derived. Several chunks may arrive concurrently.
+		atomic.CompareAndSwapUint64(&writer.Chunksize, 0, request.Size)
 
 		// save the sizes required for offset calculation
 		if strings.HasPrefix(r.RequestURI, "/dynamic_chunk?") {
-			s3backuplog.DebugPrint("Adding digest %s to dynamic chunks list, size: %d", digest, size)
-			s.Writers[int32(wid)].DynamicChunkSizes.Store(digest, size)
+			s3backuplog.DebugPrint("Adding digest %s to dynamic chunks list, size: %d", request.Digest, request.Size)
+			writer.DynamicChunkSizes.Store(request.Digest, request.Size)
 		}
 		info := ChunkUploadInfo{}
-		info.Digest = digest
+		info.Digest = request.Digest
 		info.Offset = 0 // todo
-		info.Size = int64(size)
+		info.Size = int64(request.Size)
 		info.Known = known
 
 		r := Response{Data: info}
