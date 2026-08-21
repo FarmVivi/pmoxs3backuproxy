@@ -1,7 +1,7 @@
 module tizbac/pmoxs3backuproxy
 
 // renovate: datasource=golang-version depName=go
-go 1.26.6
+go 1.27.0
 
 require (
 	github.com/elbandi/go-proxmox-backup-client v0.0.0-20230507001507-b7f2bd6f7fcd
