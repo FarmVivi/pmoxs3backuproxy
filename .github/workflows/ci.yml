@@ -50,6 +50,9 @@ jobs:
           S3TEST_ENDPOINT="$ENDPOINT" S3TEST_BUCKET="$BUCKET" \
             S3TEST_ACCESSKEY="$USERNAME" S3TEST_SECRETKEY="$PBS_PASSWORD" \
             go test ./cmd/pmoxs3backuproxy -run TestIntegrationConcurrentChunkUpload -v
+          S3TEST_ENDPOINT="$ENDPOINT" S3TEST_ACCESSKEY="$USERNAME" \
+            S3TEST_SECRETKEY="$PBS_PASSWORD" \
+            go test ./cmd/garbagecollector -run TestIntegrationGCSweep -v
           echo "start proxy"
           nohup ./pmoxs3backuproxy -endpoint $ENDPOINT -bind 127.0.0.1:8007 -debug > /tmp/nohup.out 2> /tmp/nohup.err < /dev/null &
           echo "create first backup"

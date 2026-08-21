@@ -1,15 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 	"time"
@@ -47,25 +44,25 @@ func compareSum(csum []byte, index []byte, metadatasum string) error {
 	return nil
 }
 
-func getObjectMetdata(ctx context.Context, bucketFlag string, object minio.ObjectInfo, minioClient *minio.Client) string {
+func getObjectMetadata(ctx context.Context, bucketFlag string, object minio.ObjectInfo, minioClient *minio.Client) (string, error) {
 	s3backuplog.DebugPrint("User Metadata content: [%s]", object.UserMetadata)
 	csum := object.UserMetadata["X-Amz-Meta-Csum"]
 	if csum == "" {
-		s3backuplog.WarnPrint("No metadata found, retry with StatObject", object.Key)
+		s3backuplog.WarnPrint("No metadata found for %s, retry with StatObject", object.Key)
 
 		statObject, err := minioClient.StatObject(ctx, bucketFlag, object.Key, minio.StatObjectOptions{})
 		if err != nil {
-			s3backuplog.FatalPrint("%s: unable to stat object: [%s]", object.Key, err.Error())
+			return "", fmt.Errorf("%s: unable to stat object: %w", object.Key, err)
 		}
 		s3backuplog.DebugPrint("StatObject User Metadata content: [%s]", statObject.UserMetadata)
 		csum = statObject.UserMetadata["Csum"]
 	}
 
 	if csum == "" {
-		s3backuplog.FatalPrint("%s: object has no csum metadata flag set", object.Key)
+		return "", fmt.Errorf("%s: object has no csum metadata flag set", object.Key)
 	}
 
-	return csum
+	return csum, nil
 }
 
 // withinGracePeriod reports whether an unreferenced chunk is too young to be
@@ -113,6 +110,10 @@ func main() {
 	if *debug {
 		s3backuplog.EnableDebug()
 	}
+	gracePeriod, err := hoursDuration(*chunkGraceHours)
+	if err != nil {
+		s3backuplog.FatalPrint("Invalid chunk grace period: %s", err)
+	}
 
 	skey := *secretKey
 	if skey == "" {
@@ -124,7 +125,6 @@ func main() {
 		skey = strings.Trim(skey, " \r\t\n")
 	}
 
-	var err error
 	minioClient, minioerr := minio.New(*endpointFlag, &minio.Options{
 		Creds:        credentials.NewStaticV4(*accessKeyID, skey, ""),
 		Secure:       (*secureFlag),
@@ -135,8 +135,7 @@ func main() {
 	}
 
 	s3backuplog.InfoPrint("Acquire Lock")
-	h := sha256.Sum256([]byte(*endpointFlag + "|" + *bucketFlag))
-	lockname := "PBSS3" + hex.EncodeToString(h[:])[:16]
+	lockname := s3pmoxcommon.DataStoreLockName(*endpointFlag, *bucketFlag)
 	sp := mutex.Spec{
 		Clock:   clock.WallClock,
 		Name:    lockname,
@@ -159,258 +158,118 @@ func main() {
 		s3backuplog.FatalPrint("Specified bucket [%s] does not exist", *bucketFlag)
 	}
 
-	//Phase 1 Delete backups older than retentionDays
-	s3backuplog.InfoPrint("Fetching snapshots")
-	snapshots, err := s3pmoxcommon.ListSnapshots(*minioClient, *bucketFlag, true)
+	// Inventory and mark phase. Every listing is fully materialised and every
+	// index validated before the first DELETE request is allowed.
+	s3backuplog.InfoPrint("Building complete garbage-collection inventory")
+	backupObjects, err := listObjectsFully(ctx, minioClient, *bucketFlag, minio.ListObjectsOptions{
+		Recursive: true, Prefix: "backups/", WithMetadata: true,
+	})
 	if err != nil {
-		s3backuplog.FatalPrint("Unable to list snapshots: %s", err.Error())
+		s3backuplog.FatalPrint("Unable to list backup objects safely: %s", err)
 	}
-
+	snapshots, err := s3pmoxcommon.SnapshotsFromObjects(backupObjects, *bucketFlag, true)
+	if err != nil {
+		s3backuplog.FatalPrint("Unable to parse snapshots safely: %s", err)
+	}
 	if len(snapshots) == 0 {
-		s3backuplog.InfoPrint("No snapshots found in bucket")
-		os.Exit(0)
+		s3backuplog.InfoPrint("No snapshots found in bucket; refusing to infer that every chunk is orphaned")
+		SessionsRelease.Release()
+		return
+	}
+	indexedObjects, err := listObjectsFully(ctx, minioClient, *bucketFlag, minio.ListObjectsOptions{
+		Recursive: true, Prefix: "indexed/", WithMetadata: true,
+	})
+	if err != nil {
+		s3backuplog.FatalPrint("Unable to list copied indexes safely: %s", err)
+	}
+	chunkObjects, err := listObjectsFully(ctx, minioClient, *bucketFlag, minio.ListObjectsOptions{
+		Recursive: true, Prefix: "chunks/",
+	})
+	if err != nil {
+		s3backuplog.FatalPrint("Unable to list chunks safely: %s", err)
+	}
+	markTime := time.Now()
+	if err := refreshExpiredSnapshotProtection(
+		ctx, minioClient, *bucketFlag, snapshots, backupObjects, markTime, uint64(*retentionDays),
+	); err != nil {
+		s3backuplog.FatalPrint("Unable to verify snapshot protection; nothing was deleted: %s", err)
 	}
 
-	s3backuplog.InfoPrint("%v snapshots in bucket", len(snapshots))
-	for _, s := range snapshots {
-		if s.BackupTime+(uint64(*retentionDays))*86400 < uint64(time.Now().Unix()) {
-			if s.Protected == true {
-				s3backuplog.InfoPrint("Backup %s,%s/%d is older than %d but marked as protected, skip removal.",
-					s.S3Prefix,
-					s.BackupID,
-					s.BackupTime,
-					*retentionDays,
-				)
-				continue
-			}
-			s3backuplog.InfoPrint("Backup %s is older than %d days, deleting", s.S3Prefix(), *retentionDays)
-			s.Delete(*minioClient)
-		} else {
-			s3backuplog.InfoPrint("Backup %s is newer than %d days, keeping", s.S3Prefix(), *retentionDays)
-		}
+	plan, err := buildGCPlan(
+		ctx,
+		snapshots,
+		backupObjects,
+		indexedObjects,
+		chunkObjects,
+		markTime,
+		uint64(*retentionDays),
+		gracePeriod,
+		func(ctx context.Context, object minio.ObjectInfo) (parsedIndex, error) {
+			return loadIndexFromS3(ctx, minioClient, *bucketFlag, object)
+		},
+		func(ctx context.Context, object minio.ObjectInfo) (string, error) {
+			return getObjectMetadata(ctx, *bucketFlag, object, minioClient)
+		},
+	)
+	if err != nil {
+		s3backuplog.FatalPrint("Garbage-collection mark phase failed; nothing was deleted: %s", err)
 	}
 
-	//Phase 2 Figure out which objects under indexed/ are orphaned and delete them
-
-	knownHashes := make(map[string]bool)
-	knownChunks := make(map[string][]string)
-	existingChunks := make(map[string]bool)
-	// Size of every chunk that survived the sweep, gathered from the listing
-	// that the sweep performs anyway. This is what makes the usage report
-	// below free: no extra request, no download.
-	chunkSizes := make(map[string]uint64)
-	// Logical size of each archive, read from the index headers that the mark
-	// phase already loads in memory.
-	archiveSizes := make(map[string]uint64)
-	s3backuplog.InfoPrint("Fetching object hashes")
-	for object := range minioClient.ListObjects(ctx, *bucketFlag, minio.ListObjectsOptions{
-		Recursive:    true,
-		Prefix:       "backups/",
-		WithMetadata: true,
-	}) {
-		// indexed folder only set for fixed index snapshots
-		if !strings.HasSuffix(object.Key, ".fidx") {
-			continue
-		}
-		csum := getObjectMetdata(ctx, *bucketFlag, object, minioClient)
-		knownHashes[csum] = true
-	}
-	s3backuplog.InfoPrint("%v object hashes found", len(knownHashes))
-
-	s3backuplog.InfoPrint("Removing orphaned object hashes")
-	objectsCh := make(chan minio.ObjectInfo)
-	go func() {
-		defer close(objectsCh)
-		for object := range minioClient.ListObjects(ctx, *bucketFlag, minio.ListObjectsOptions{
-			Recursive:    true,
-			Prefix:       "indexed/",
-			WithMetadata: true,
-		}) {
-			_, ok := knownHashes[getObjectMetdata(ctx, *bucketFlag, object, minioClient)]
-			if !ok {
-				s3backuplog.InfoPrint("Removing orphaned object hash %s for object %s", getObjectMetdata(ctx, *bucketFlag, object, minioClient), object.Key)
-				objectsCh <- object
-			}
-		}
-	}()
-
-	errorCh := minioClient.RemoveObjects(context.Background(), *bucketFlag, objectsCh, minio.RemoveObjectsOptions{})
-	for e := range errorCh {
-		s3backuplog.ErrorPrint("Failed to remove " + e.ObjectName + ", error: " + e.Err.Error())
-	}
-	//Phase 3 Mark Used chunks
-	for object := range minioClient.ListObjects(ctx, *bucketFlag, minio.ListObjectsOptions{
-		Recursive:    true,
-		Prefix:       "backups/",
-		WithMetadata: true,
-	}) {
-		if strings.HasSuffix(object.Key, ".fidx") {
-			s3backuplog.InfoPrint("Processing fixed index: %s", object.Key)
-			o, err := minioClient.GetObject(ctx, *bucketFlag, object.Key, minio.GetObjectOptions{})
-			if err != nil {
-				s3backuplog.FatalPrint("Error accessing object %s: %s", object.Key, err.Error())
-			}
-			data, err := io.ReadAll(o)
-			if err != nil {
-				s3backuplog.FatalPrint("Error reading object %s: %s", object.Key, err.Error())
-			}
-			if len(data) < 4096 {
-				s3backuplog.FatalPrint("Error reading object %s: Too small", object.Key)
-			}
-			if !bytes.Equal(data[0:8], s3pmoxcommon.PROXMOX_INDEX_MAGIC_FIXED[:]) {
-				s3backuplog.FatalPrint("Fixed index %s has wrong magic", object.Key)
-			}
-			if csumerr := compareSum(data[32:64], data[4096:], getObjectMetdata(ctx, *bucketFlag, object, minioClient)); csumerr != nil {
-				s3backuplog.FatalPrint("%s", csumerr.Error())
-			}
-
-			archiveSizes[object.Key] = binary.LittleEndian.Uint64(data[64:72])
-
-			data = data[4096:]
-			if len(data)%32 != 0 {
-				s3backuplog.FatalPrint("Error examining object %s: Data after header length is not 32 bytes aligned", object.Key)
-			}
-			for i := 0; i < len(data)/32; i++ {
-				val, ok := knownChunks[hex.EncodeToString(data[i*32:(i+1)*32])]
-				if !ok {
-					val = make([]string, 0)
-				}
-				val = append(val, object.Key)
-				knownChunks[hex.EncodeToString(data[i*32:(i+1)*32])] = val
-			}
-		}
-		if strings.HasSuffix(object.Key, ".didx") {
-			s3backuplog.InfoPrint("Processing dynamic index: %s", object.Key)
-			o, err := minioClient.GetObject(ctx, *bucketFlag, object.Key, minio.GetObjectOptions{})
-			if err != nil {
-				s3backuplog.FatalPrint("Error accessing object %s: %s", object.Key, err.Error())
-			}
-			data, err := io.ReadAll(o)
-			if err != nil {
-				s3backuplog.FatalPrint("Error reading object %s: %s", object.Key, err.Error())
-			}
-			if len(data) < 4096 {
-				s3backuplog.FatalPrint("Error reading object %s: Too small", object.Key)
-			}
-			if !bytes.Equal(data[0:8], s3pmoxcommon.PROXMOX_INDEX_MAGIC_DYNAMIC[:]) {
-				s3backuplog.FatalPrint("Dynamic index %s has wrong magic", object.Key)
-			}
-			if csumerr := compareSum(data[32:64], data[4096:], getObjectMetdata(ctx, *bucketFlag, object, minioClient)); csumerr != nil {
-				s3backuplog.FatalPrint("%s", csumerr.Error())
-			}
-
-			if len(data) > 4096 {
-				// A dynamic index states the archive size in the end offset
-				// of its last entry, entries being 40 bytes each.
-				last := 4096 + ((len(data)-4096)/40-1)*40
-				if last >= 4096 && last+8 <= len(data) {
-					archiveSizes[object.Key] = binary.LittleEndian.Uint64(data[last : last+8])
-				}
-			}
-
-			reader := bytes.NewReader(data[4096:])
-			var offset int64 = 0
-			for {
-				var chunk_offset = make([]byte, 8)
-				var digest_offset = make([]byte, 32)
-				reader.ReadAt(chunk_offset, offset)
-				offset += 8
-				reader.ReadAt(digest_offset, offset)
-				offset += 32
-				chunk_off := binary.LittleEndian.Uint64(chunk_offset)
-				s3backuplog.DebugPrint("Offset: %d", uint64(chunk_off))
-				val := hex.EncodeToString(digest_offset)
-				s3backuplog.DebugPrint("Digest: %s", val)
-				known, ok := knownChunks[val]
-				if !ok {
-					known = make([]string, 0)
-				}
-				known = append(known, object.Key)
-				knownChunks[val] = known
-
-				if offset == int64(reader.Len()) {
-					break
+	// Missing referenced chunks mean the inventory is corrupt or inconsistent.
+	// Mark affected snapshots, but never sweep anything during that run.
+	if len(plan.missingChunks) > 0 {
+		for digest, references := range plan.missingChunks {
+			s3backuplog.ErrorPrint(
+				"Corruption detected, chunk %s, referenced by %s is missing",
+				digest,
+				strings.Join(references, ","),
+			)
+			for _, objectName := range references {
+				parts := strings.Split(objectName, "/")
+				basePath := strings.Join(parts[:len(parts)-1], "/")
+				reader := strings.NewReader("CORRUPTED")
+				if _, err := minioClient.PutObject(
+					ctx, *bucketFlag, basePath+"/corrupted", reader, 9, minio.PutObjectOptions{},
+				); err != nil {
+					s3backuplog.FatalPrint("Error tagging %s as corrupt: %s", objectName, err)
 				}
 			}
 		}
+		s3backuplog.FatalPrint(
+			"Integrity check found %d missing referenced chunks; nothing was deleted",
+			len(plan.missingChunks),
+		)
 	}
 
-	s3backuplog.InfoPrint("Enumerated %d referenced chunks", len(knownChunks))
-	//Delete orphaned chunks
-
-	/**
-	 * A chunk is uploaded before the index that references it is written, so
-	 * a chunk belonging to a backup that is still running looks exactly like
-	 * an orphan: nothing points at it yet. Deleting it would silently corrupt
-	 * that backup, and the local mutex above only excludes other collector
-	 * runs, never the proxy.
-	 *
-	 * Like Proxmox Backup Server does, recently written chunks are therefore
-	 * left alone. They are collected by the next run, once their index exists
-	 * and marks them as referenced.
-	 **/
-	gracePeriod := time.Duration(*chunkGraceHours) * time.Hour
-	graceNow := time.Now()
-	var protectedByGrace uint64
-
-	objectsCh = make(chan minio.ObjectInfo)
-	go func() {
-		defer close(objectsCh)
-		for object := range minioClient.ListObjects(ctx, *bucketFlag, minio.ListObjectsOptions{Recursive: true, Prefix: "chunks/"}) {
-			chunkhash := strings.ReplaceAll(object.Key[7:], "/", "")
-			_, ok := knownChunks[chunkhash]
-			if !ok {
-				if withinGracePeriod(object.LastModified, graceNow, gracePeriod) {
-					s3backuplog.DebugPrint(
-						"Chunk %s is unreferenced but was written %s ago, within the %d hours grace period, skip removal",
-						chunkhash,
-						time.Since(object.LastModified).Truncate(time.Second),
-						*chunkGraceHours,
-					)
-					protectedByGrace++
-					continue
-				}
-				objectsCh <- object
-			} else {
-				s3backuplog.DebugPrint("Chunk still referenced: %s, skip removal", chunkhash)
-				existingChunks[chunkhash] = true
-				chunkSizes[chunkhash] = uint64(object.Size)
-			}
-		}
-	}()
-
-	s3backuplog.InfoPrint("Removing orphaned chunks")
-	errorCh = minioClient.RemoveObjects(context.Background(), *bucketFlag, objectsCh, minio.RemoveObjectsOptions{})
-	for e := range errorCh {
-		s3backuplog.ErrorPrint("Failed to remove " + e.ObjectName + ", error: " + e.Err.Error())
+	s3backuplog.InfoPrint(
+		"GC plan validated: %d snapshots (%d objects), %d copied indexes and %d chunks to remove; %d chunks referenced",
+		len(plan.expiredSnapshots),
+		len(plan.backupObjects),
+		len(plan.indexedObjects),
+		len(plan.chunkObjects),
+		len(plan.knownChunks),
+	)
+	for _, snapshot := range plan.expiredSnapshots {
+		s3backuplog.InfoPrint("Backup %s is older than %d days, deleting", snapshot.S3Prefix(), *retentionDays)
 	}
-	if protectedByGrace > 0 {
+	if err := executeGCPlan(ctx, minioClient, *bucketFlag, plan); err != nil {
+		s3backuplog.FatalPrint("Garbage-collection sweep failed: %s", err)
+	}
+	if plan.protectedByGrace > 0 {
 		s3backuplog.InfoPrint(
-			"%d unreferenced chunks kept, written less than %d hours ago (a backup may be running)",
-			protectedByGrace,
+			"%d unreferenced chunks kept, written less than %d hours ago",
+			plan.protectedByGrace,
 			*chunkGraceHours,
 		)
 	}
-	// Do an integrity check to ensure that all referenced chunks exist
-	s3backuplog.InfoPrint("Running integrity check")
-	for k, v := range knownChunks {
-		_, ok := existingChunks[k]
-		if !ok {
-			s3backuplog.ErrorPrint("Corruption detected, chunk %s, referenced by %s is missing!!", k, strings.Join(v, ","))
-			//We mark the backup corrupted to allow new backup to skip incremental and recreate missing chunks
-			for _, oname := range v {
-				basepatht := strings.Split(oname, "/")
-				basepatht = basepatht[0 : len(basepatht)-1]
-				basepath := strings.Join(basepatht, "/")
-				r := strings.NewReader("CORRUPTED")
-				_, err := minioClient.PutObject(ctx, *bucketFlag, basepath+"/corrupted", r, 9, minio.PutObjectOptions{})
-				if err != nil {
-					s3backuplog.FatalPrint("Error tagging %s as corrupt: %s", oname, err.Error())
-				}
-			}
-		}
-	}
-	writeUsageStats(ctx, minioClient, *bucketFlag, knownChunks, chunkSizes, archiveSizes)
+	writeUsageStats(
+		ctx,
+		minioClient,
+		*bucketFlag,
+		plan.knownChunks,
+		plan.chunkSizes,
+		plan.archiveSizes,
+	)
 
 	s3backuplog.InfoPrint("Finished")
 	SessionsRelease.Release()
