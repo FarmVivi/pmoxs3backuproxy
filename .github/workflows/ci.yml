@@ -2,43 +2,82 @@ name: test backup and restore functionality
 on: [push, pull_request]
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    env:
+      # renovate: datasource=docker depName=minio/minio versioning=docker
+      MINIO_IMAGE: minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+      # renovate: datasource=docker depName=minio/mc versioning=docker
+      MINIO_MC_IMAGE: minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+      # renovate: datasource=deb depName=proxmox-backup-client
+      PROXMOX_BACKUP_CLIENT_VERSION: 3.4.7-1
+      # renovate: datasource=deb depName=libproxmox-backup-qemu0-dev
+      PROXMOX_BACKUP_QEMU_DEV_VERSION: 1.5.2
     steps:
-      - uses: actions/checkout@v1
-      - name: Setup MinIO Server
-        uses: infleet/minio-action@v0.0.1
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          port: "9000"
-          version: "latest"
-      - name: Setup MinIO client
-        uses: yakubique/setup-minio-cli@v1
-      - name: Setup golang
-        uses: actions/setup-go@v5
-        with:
-          go-version: '>=1.22.4'
-      - name: "Create minio access"
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Start pinned MinIO server
         run: |
-          mc alias set 'ci' 'http://127.0.0.1:9000' 'minioadmin' 'minioadmin'
-          mc mb ci/backups
-          mc admin user svcacct add ci minioadmin --json > /tmp/minio.json
-      - name: "Install proxmox backup client"
+          docker run --detach --rm --name minio-ci \
+            --publish 9000:9000 \
+            --env MINIO_ROOT_USER=minioadmin \
+            --env MINIO_ROOT_PASSWORD=minioadmin \
+            "$MINIO_IMAGE" server /data --address :9000
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs minio-ci
+          exit 1
+
+      - name: Create MinIO access
+        run: |
+          mkdir -p /tmp/minio-mc
+          docker run --rm --network host --volume /tmp/minio-mc:/tmp/minio-mc \
+            "$MINIO_MC_IMAGE" --config-dir /tmp/minio-mc alias set ci \
+            http://127.0.0.1:9000 minioadmin minioadmin
+          docker run --rm --network host --volume /tmp/minio-mc:/tmp/minio-mc \
+            "$MINIO_MC_IMAGE" --config-dir /tmp/minio-mc mb ci/backups
+          docker run --rm --network host --volume /tmp/minio-mc:/tmp/minio-mc \
+            "$MINIO_MC_IMAGE" --config-dir /tmp/minio-mc admin user svcacct add \
+            ci minioadmin --json > /tmp/minio.json
+
+      - name: Install Proxmox Backup Client
         run: |
           sudo apt update -y
-          sudo apt install jq wget gawk -y
-          sudo wget https://enterprise.proxmox.com/debian/proxmox-release-bookworm.gpg -O /etc/apt/trusted.gpg.d/proxmox-release-bookworm.gpg
+          curl --fail --silent --show-error \
+            https://enterprise.proxmox.com/debian/proxmox-release-bookworm.gpg \
+            --output /tmp/proxmox-release-bookworm.gpg
+          echo "13a87cec79f2d05f40f125629e4b509080a5c0286608bea273e36be9809ecaba  /tmp/proxmox-release-bookworm.gpg" | sha256sum --check
+          sudo install -o root -g root -m 0644 /tmp/proxmox-release-bookworm.gpg \
+            /etc/apt/trusted.gpg.d/proxmox-release-bookworm.gpg
+          # Proxmox currently serves a mismatched certificate on this mirror's
+          # HTTPS endpoint. APT still authenticates every package with the
+          # pinned repository signing key.
           echo "deb http://download.proxmox.com/debian/pbs-client bookworm main" | sudo tee -a /etc/apt/sources.list.d/pbs.list
           echo "deb http://download.proxmox.com/debian/pve bookworm pve-no-subscription" | sudo tee -a /etc/apt/sources.list.d/pve.list
           sudo apt update -y
-          sudo apt install -y proxmox-backup-client libproxmox-backup-qemu0-dev
-      - name: "Build Proxy and GC"
+          sudo apt install -y \
+            "proxmox-backup-client=$PROXMOX_BACKUP_CLIENT_VERSION" \
+            "libproxmox-backup-qemu0-dev=$PROXMOX_BACKUP_QEMU_DEV_VERSION"
+
+      - name: Build Proxy and GC
         run: |
-          go get github.com/elbandi/go-proxmox-backup-client
-          go get github.com/schollz/progressbar/v3
+          go mod verify
           go test -race ./cmd/... ./internal/...
-          go build  tizbac/pmoxs3backuproxy/cmd/pmoxs3backuproxy
-          go build  tizbac/pmoxs3backuproxy/cmd/garbagecollector
+          go build tizbac/pmoxs3backuproxy/cmd/pmoxs3backuproxy
+          go build tizbac/pmoxs3backuproxy/cmd/garbagecollector
           go build -o fdxtest tizbac/pmoxs3backuproxy/test
-      - name: "Create backup and test restore"
+
+      - name: Create backup and test restore
         run: |
           echo "start proxy"
           export PBS_PASSWORD=$(jq -r .secretKey < /tmp/minio.json)
@@ -55,6 +94,16 @@ jobs:
             go test ./cmd/garbagecollector -run TestIntegrationGCSweep -v
           echo "start proxy"
           nohup ./pmoxs3backuproxy -endpoint $ENDPOINT -bind 127.0.0.1:8007 -debug > /tmp/nohup.out 2> /tmp/nohup.err < /dev/null &
+          for attempt in $(seq 1 30); do
+            if curl --insecure --fail --silent https://127.0.0.1:8007/api2/json/version >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              cat /tmp/nohup.out /tmp/nohup.err
+              exit 1
+            fi
+            sleep 1
+          done
           echo "create first backup"
           sudo -E proxmox-backup-client backup proxy.pxar:. --backup-id testbackup > /tmp/first_backup 2>&1
           cat /tmp/first_backup
@@ -91,3 +140,13 @@ jobs:
           proxmox-backup-client list
           echo "forget snapshot"
           proxmox-backup-client snapshot forget "$VER"
+
+      - name: Show service logs on failure
+        if: failure()
+        run: |
+          docker logs minio-ci || true
+          cat /tmp/nohup.out /tmp/nohup.err || true
+
+      - name: Stop MinIO
+        if: always()
+        run: docker rm --force minio-ci || true

@@ -1,0 +1,61 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "enabledManagers": ["custom.regex"],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Update the Go language/toolchain directive not covered by Dependabot gomod",
+      "managerFilePatterns": ["/^go\\.mod$/"],
+      "matchStrings": [
+        "// renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\ngo (?<currentValue>\\S+)"
+      ]
+    },
+    {
+      "customType": "regex",
+      "description": "Update pinned tool versions passed as GitHub Action inputs",
+      "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\n\\s+version: (?<currentValue>\\S+)"
+      ]
+    },
+    {
+      "customType": "regex",
+      "description": "Update test-only Docker images embedded in GitHub Actions environment variables",
+      "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>docker) depName=(?<depName>\\S+) versioning=(?<versioning>\\S+)\\n\\s+\\S+: \\S+:(?<currentValue>[^@\\s]+)@(?<currentDigest>sha256:[a-f0-9]+)"
+      ]
+    },
+    {
+      "customType": "regex",
+      "description": "Update the pinned Proxmox Backup Client package",
+      "managerFilePatterns": ["/^\\.github/workflows/ci\\.yml$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>deb) depName=(?<depName>proxmox-backup-client)\\n\\s+\\S+: (?<currentValue>\\S+)"
+      ],
+      "registryUrlTemplate": "http://download.proxmox.com/debian/pbs-client?suite=bookworm&components=main&binaryArch=amd64"
+    },
+    {
+      "customType": "regex",
+      "description": "Update the pinned Proxmox QEMU development package",
+      "managerFilePatterns": ["/^\\.github/workflows/ci\\.yml$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>deb) depName=(?<depName>libproxmox-backup-qemu0-dev)\\n\\s+\\S+: (?<currentValue>\\S+)"
+      ],
+      "registryUrlTemplate": "http://download.proxmox.com/debian/pve?suite=bookworm&components=pve-no-subscription&binaryArch=amd64"
+    },
+    {
+      "customType": "regex",
+      "description": "Update pinned container examples in the README",
+      "managerFilePatterns": ["/^README\\.md$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>docker) depName=(?<depName>\\S+) versioning=(?<versioning>\\S+)\\n\\s+(?:image:|PROXY_IMAGE=)\\s*\\S+:(?<currentValue>\\S+)"
+      ]
+    }
+  ],
+  "dependencyDashboard": true,
+  "labels": ["dependencies", "renovate"],
+  "prConcurrentLimit": 3,
+  "prHourlyLimit": 1,
+  "rangeStrategy": "pin"
+}
