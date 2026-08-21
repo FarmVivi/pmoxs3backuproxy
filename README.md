@@ -131,7 +131,7 @@ Usage of ./pmoxs3backuproxy:
   -snapshotcachettl uint
         Seconds a snapshot listing is reused before listing the bucket again, 0 disables caching (default 30)
   -usagecachettl uint
-        Seconds before the used space of a datastore is recomputed in the background (default 900)
+        Seconds before the used space of a datastore is recomputed in the background (default 60)
   -usessl
         Enable SSL connection to the endpoint, for use with cloud S3 providers
 ```

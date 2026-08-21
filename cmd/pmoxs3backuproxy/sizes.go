@@ -43,6 +43,10 @@ import (
 // only bounds the memory of a very long lived process.
 var archiveSizeCache *ttlCache[uint64]
 
+// manifestCryptModeCache avoids downloading immutable index.json.blob files
+// again whenever the short-lived snapshot list cache refreshes.
+var manifestCryptModeCache *ttlCache[map[string]string]
+
 // datastoreUsageCache holds the result of walking a whole bucket, which is far
 // too expensive to do on the PVE polling path. It is always read through
 // GetAsync.
@@ -57,6 +61,12 @@ const sizeLookupConcurrency = 16
 // short: failing it costs nothing but a fallback to the listing walk.
 const bucketHeaderProbeTimeout = 10 * time.Second
 
+// coldUsageCacheWait stays well below PVE's hard seven-second PBS timeout but
+// lets fast provider-side counters populate the very first status response
+// after a proxy restart. Without it, the health placeholder becomes a false
+// low RRD sample even though the real value arrives milliseconds later.
+const coldUsageCacheWait = 2 * time.Second
+
 // DataStoreUsage is what a full walk of a bucket tells us. Every figure comes
 // from object listings only: no object is ever downloaded to produce it.
 type DataStoreUsage struct {
@@ -64,6 +74,23 @@ type DataStoreUsage struct {
 	ChunkBytes uint64 // of which chunks, the deduplicated payload
 	Objects    uint64
 	Snapshots  uint64
+}
+
+func waitForDataStoreUsage(key string, timeout time.Duration) (DataStoreUsage, bool) {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if usage, ok := datastoreUsageCache.Peek(key); ok {
+				return usage, true
+			}
+		case <-deadline.C:
+			return DataStoreUsage{}, false
+		}
+	}
 }
 
 // FillArchiveSizes sets the Size field of each snapshot to the sum of the
@@ -130,6 +157,42 @@ func FillArchiveSizes(c *minio.Client, snapshots []s3pmoxcommon.Snapshot) {
 	for i, j := range jobs {
 		snapshots[j.snapshot].Size += sizes[i]
 	}
+}
+
+// FillSnapshotCryptModes reads uncached manifests with bounded concurrency and
+// applies their authoritative encryption modes to the S3 object listing.
+func FillSnapshotCryptModes(c *minio.Client, snapshots []s3pmoxcommon.Snapshot) {
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	workerCount := sizeLookupConcurrency
+	if len(snapshots) < workerCount {
+		workerCount = len(snapshots)
+	}
+	for range workerCount {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				key := snapshots[i].Datastore + "/" + snapshots[i].S3Prefix() + "/index.json.blob"
+				modes, fresh, err := manifestCryptModeCache.Get(key, func() (map[string]string, error) {
+					return s3pmoxcommon.ReadSnapshotCryptModes(context.Background(), c, snapshots[i])
+				})
+				if err != nil {
+					s3backuplog.WarnPrint("Unable to read snapshot encryption modes from %s: %s", key, err)
+					continue
+				}
+				if fresh {
+					s3backuplog.DebugPrint("Cached snapshot encryption modes from %s", key)
+				}
+				s3pmoxcommon.ApplySnapshotCryptModes(&snapshots[i], modes)
+			}
+		}()
+	}
+	for i := range snapshots {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
 }
 
 // SnapshotSizeMode selects which figure the snapshot listing reports as the

@@ -166,6 +166,7 @@ func (S *Snapshot) GetFiles(c minio.Client) {
 		file := SnapshotFile{}
 		path := strings.Split(object.Key, "/")
 		file.Filename = path[2]
+		file.CryptMode = "none"
 		file.Size = uint64(object.Size)
 		S.Files = append(S.Files, file)
 	}

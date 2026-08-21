@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -26,12 +27,20 @@ type chunkRequest struct {
 	ObjectName  string
 }
 
+func chunkObjectName(digest string) (string, error) {
+	decoded, err := hex.DecodeString(digest)
+	if err != nil || len(decoded) != sha256.Size {
+		return "", fmt.Errorf("invalid SHA-256 chunk digest %q", digest)
+	}
+	return fmt.Sprintf("chunks/%s/%s/%s", digest[0:2], digest[2:4], digest[4:]), nil
+}
+
 func parseChunkRequest(r *http.Request) (chunkRequest, error) {
 	q := r.URL.Query()
 	digest := q.Get("digest")
-	decoded, err := hex.DecodeString(digest)
-	if err != nil || len(decoded) != 32 {
-		return chunkRequest{}, fmt.Errorf("invalid SHA-256 chunk digest %q", digest)
+	objectName, err := chunkObjectName(digest)
+	if err != nil {
+		return chunkRequest{}, err
 	}
 
 	encodedSize, err := strconv.ParseInt(q.Get("encoded-size"), 10, 64)
@@ -60,12 +69,7 @@ func parseChunkRequest(r *http.Request) (chunkRequest, error) {
 		EncodedSize: encodedSize,
 		Size:        size,
 		WriterID:    int32(wid),
-		ObjectName: fmt.Sprintf(
-			"chunks/%s/%s/%s",
-			digest[0:2],
-			digest[2:4],
-			digest[4:],
-		),
+		ObjectName:  objectName,
 	}, nil
 }
 
