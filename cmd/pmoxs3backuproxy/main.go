@@ -101,6 +101,8 @@ var (
 	date    = "unknown"
 )
 
+const defaultCacheTTLSeconds uint64 = 3600
+
 func writeBinary(buf *bytes.Buffer, data interface{}) {
 	err := binary.Write(buf, binary.LittleEndian, data)
 	if err != nil {
@@ -161,16 +163,44 @@ func main() {
 	ticketExpireFlag := flag.Uint64("ticketexpire", 3600, "API Ticket expire time in seconds")
 	lookupTypeFlag := flag.String("lookuptype", "auto", "Bucket lookup type: auto,dns,path")
 	bucketCacheTTLFlag := flag.Uint64(
-		"bucketcachettl", 60,
+		"bucketcachettl", defaultCacheTTLSeconds,
 		"Seconds a datastore (bucket) listing is reused before asking the S3 endpoint again, 0 disables caching",
 	)
 	snapshotCacheTTLFlag := flag.Uint64(
-		"snapshotcachettl", 30,
+		"snapshotcachettl", defaultCacheTTLSeconds,
 		"Seconds a snapshot listing is reused before listing the bucket again, 0 disables caching",
 	)
 	usageCacheTTLFlag := flag.Uint64(
-		"usagecachettl", 60,
+		"usagecachettl", defaultCacheTTLSeconds,
 		"Seconds before the used space of a datastore is recomputed in the background",
+	)
+	metadataCacheTTLFlag := flag.Uint64(
+		"metadatacachettl", defaultCacheTTLSeconds,
+		"Seconds archive sizes and encryption modes are cached after an opt-in metadata read",
+	)
+	gcStatsCacheTTLFlag := flag.Uint64(
+		"gcstatscachettl", defaultCacheTTLSeconds,
+		"Seconds a garbage-collector usage report is cached after an opt-in read",
+	)
+	reportDataStoreUsageFlag := flag.Bool(
+		"reportdatastoreusage", false,
+		"Report real bucket usage in datastore status (adds periodic S3 metadata requests)",
+	)
+	reportArchiveSizeFlag := flag.Bool(
+		"reportarchivesize", false,
+		"Report logical archive sizes (adds one small ranged GET per uncached archive)",
+	)
+	reportEncryptionFlag := flag.Bool(
+		"reportencryption", false,
+		"Report client-side encryption modes (adds one manifest GET per uncached snapshot)",
+	)
+	reportGCStatsFlag := flag.Bool(
+		"reportgcstats", false,
+		"Read the garbage-collector usage report for referenced/exclusive snapshot sizes",
+	)
+	cacheInvalidationDirFlag := flag.String(
+		"cacheinvalidatedir", "",
+		"Shared local directory for proxy/collector cache invalidation tokens; empty disables cross-process invalidation",
 	)
 	datastoreSizeFlag := flag.Uint64(
 		"datastoresize", 0,
@@ -206,9 +236,14 @@ func main() {
 	datastoreUsageCache = newTTLCache[DataStoreUsage](time.Duration(*usageCacheTTLFlag) * time.Second)
 	// An index under backups/ never changes, so its size is cached for as long
 	// as the process is expected to run between restarts.
-	archiveSizeCache = newTTLCache[uint64](24 * time.Hour)
-	manifestCryptModeCache = newTTLCache[map[string]string](24 * time.Hour)
-	usageStatsCache = newTTLCache[[]byte](5 * time.Minute)
+	archiveSizeCache = newTTLCache[uint64](time.Duration(*metadataCacheTTLFlag) * time.Second)
+	manifestCryptModeCache = newTTLCache[map[string]string](time.Duration(*metadataCacheTTLFlag) * time.Second)
+	usageStatsCache = newTTLCache[[]byte](time.Duration(*gcStatsCacheTTLFlag) * time.Second)
+	reportDataStoreUsage = *reportDataStoreUsageFlag
+	reportArchiveSize = *reportArchiveSizeFlag
+	reportEncryption = *reportEncryptionFlag
+	reportGCStats = *reportGCStatsFlag
+	configureCacheInvalidations(*cacheInvalidationDirFlag, *endpointFlag)
 	datastoreCapacity = *datastoreSizeFlag
 	if !ValidSnapshotSizeMode(*snapshotSizeFlag) {
 		s3backuplog.FatalPrint(
@@ -217,6 +252,9 @@ func main() {
 		)
 	}
 	snapshotSizeMode = SnapshotSizeMode(*snapshotSizeFlag)
+	if snapshotSizeMode != SnapshotSizeLogical && !reportGCStats {
+		s3backuplog.FatalPrint("-snapshotsize %s requires the explicit -reportgcstats option", snapshotSizeMode)
+	}
 	if snapshotSizeMode != SnapshotSizeLogical {
 		s3backuplog.InfoPrint(
 			"Backups are reported with their %s size, which the garbage collector computes; "+
@@ -272,12 +310,36 @@ func listSnapshotsCached(c *minio.Client, datastore string) ([]s3pmoxcommon.Snap
 		if err != nil {
 			return nil, err
 		}
-		FillSnapshotCryptModes(c, s)
-		FillArchiveSizes(c, s)
-		ApplySnapshotSizeMode(snapshotSizeMode, s, readUsageStats(c, datastore))
+		applyOptionalSnapshotReports(c, datastore, s)
 		return s, nil
 	})
 	return snapshots, err
+}
+
+func applyOptionalSnapshotReports(c *minio.Client, datastore string, snapshots []s3pmoxcommon.Snapshot) {
+	if reportEncryption {
+		FillSnapshotCryptModes(c, snapshots)
+	}
+	if reportArchiveSize {
+		FillArchiveSizes(c, snapshots)
+	}
+	if reportGCStats {
+		ApplySnapshotSizeMode(snapshotSizeMode, snapshots, readUsageStats(c, datastore))
+	}
+}
+
+func readDataStoreUsageForStatus(
+	datastore string,
+	fetch func() (DataStoreUsage, error),
+) (DataStoreUsage, bool) {
+	if !reportDataStoreUsage {
+		return DataStoreUsage{}, false
+	}
+	usage, known := datastoreUsageCache.GetAsync(datastore, fetch)
+	if known {
+		return usage, true
+	}
+	return waitForDataStoreUsage(datastore, coldUsageCacheWait)
 }
 
 // groupSize keeps the historical placeholder when the real size is unknown, as
@@ -288,14 +350,6 @@ func groupSize(size uint64) uint64 {
 		return 200
 	}
 	return size
-}
-
-// invalidateDataStoreCaches drops what the proxy knows about a datastore whose
-// content it just changed, so the next request reflects the change instead of
-// waiting out a TTL.
-func invalidateDataStoreCaches(datastore string) {
-	snapshotListCache.Invalidate(datastore)
-	datastoreUsageCache.Expire(datastore)
 }
 
 // readUsageStats returns the collector report of a datastore, or nil when
@@ -381,6 +435,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if len(path) >= 7 && strings.HasPrefix(r.RequestURI, "/api2/json/admin/datastore/") && auth {
 		ds := path[5]
 		action := path[6]
+		syncDataStoreCacheInvalidation(ds)
 		if strings.HasPrefix(action, "notes") && r.Method == "GET" {
 			var ss s3pmoxcommon.Snapshot
 			ss.InitWithQuery(r.URL.Query())
@@ -426,6 +481,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				w.Write([]byte(err.Error()))
 				return
 			}
+			publishDataStoreCacheInvalidation(ds)
 			w.WriteHeader(http.StatusOK)
 		}
 		if strings.HasPrefix(action, "files") && r.Method == "GET" {
@@ -434,7 +490,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ss.Datastore = ds
 			ss.GetFiles(*C.Client)
 			filesSnapshot := []s3pmoxcommon.Snapshot{ss}
-			FillSnapshotCryptModes(C.Client, filesSnapshot)
+			if reportEncryption {
+				FillSnapshotCryptModes(C.Client, filesSnapshot)
+			}
 			ss = filesSnapshot[0]
 			w.Header().Add("Content-Type", "application/json")
 			resp, _ := json.Marshal(Response{
@@ -504,6 +562,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			)
 			if err != nil {
 				s3backuplog.ErrorPrint("Protection: Unable to set tag for object: %s: %s", ss.S3Prefix(), err.Error())
+			} else {
+				publishDataStoreCacheInvalidation(ds)
 			}
 			w.Header().Add("Content-Type", "application/json")
 			resp, _ := json.Marshal(Response{
@@ -533,6 +593,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			 * It exists so a human or a script can ask what a snapshot really
 			 * costs, which no column of the PVE interface can show.
 			 **/
+			if !reportGCStats {
+				http.Error(w, "GC usage reporting is disabled; start the proxy with -reportgcstats", http.StatusNotFound)
+				return
+			}
 			stats, _, err := usageStatsCache.Get(ds, func() ([]byte, error) {
 				obj, err := C.Client.GetObject(
 					context.Background(), ds, s3pmoxcommon.UsageStatsObject, minio.GetObjectOptions{},
@@ -566,17 +630,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			 * the storage unusable. Until the first walk completes, the
 			 * placeholder below keeps the storage reported as healthy.
 			 **/
-			usage, known := datastoreUsageCache.GetAsync(ds, func() (DataStoreUsage, error) {
+			usage, known := readDataStoreUsageForStatus(ds, func() (DataStoreUsage, error) {
 				return ComputeDataStoreUsage(C, s.SecureFlag, ds)
 			})
-			if !known {
-				usage, known = waitForDataStoreUsage(ds, coldUsageCacheWait)
-				if !known {
-					s3backuplog.WarnPrint(
-						"Datastore [%s] usage is not available after %s; returning the startup placeholder while refresh continues",
-						ds, coldUsageCacheWait,
-					)
-				}
+			if reportDataStoreUsage && !known {
+				s3backuplog.WarnPrint(
+					"Datastore [%s] usage is not available after %s; returning the startup placeholder while refresh continues",
+					ds, coldUsageCacheWait,
+				)
 			}
 
 			status := DataStoreStatus{
@@ -704,6 +765,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			s3backuplog.InfoPrint("Saved backup log: %s", tgtfile)
+			publishDataStoreCacheInvalidation(ds)
 			w.WriteHeader(http.StatusOK)
 		}
 
@@ -713,15 +775,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				ss.InitWithForm(r)
 				ss.Datastore = ds
 				s3backuplog.InfoPrint("Removing snapshot: %s as requested by user", ss.S3Prefix())
-				invalidateDataStoreCaches(ds)
+				invalidateDataStoreCachesLocal(ds)
 				if err := ss.Delete(*C.Client); err == nil {
-					invalidateDataStoreCaches(ds)
+					publishDataStoreCacheInvalidation(ds)
 					w.Header().Add("Content-Type", "application/json")
 					resp, _ := json.Marshal(Response{
 						Data: ss,
 					})
 					w.Write(resp)
 				} else {
+					// RemoveObjects may have deleted only part of the snapshot before
+					// reporting an error. Invalidate even on failure.
+					publishDataStoreCacheInvalidation(ds)
 					w.WriteHeader(http.StatusInternalServerError)
 					io.WriteString(w, err.Error())
 				}
@@ -776,7 +841,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if s.SelectedDataStore != nil {
 			// A new snapshot has just landed: let the UI see it without
 			// waiting out the listing TTL.
-			invalidateDataStoreCaches(*s.SelectedDataStore)
+			publishDataStoreCacheInvalidation(*s.SelectedDataStore)
 		}
 	}
 	if strings.HasPrefix(r.RequestURI, "/previous_backup_time") && s.H2Ticket != nil && r.Method == "GET" {
@@ -1560,7 +1625,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			connectionList[username] = minioClient
 
-			_, listerr := connectionList[username].ListBuckets(context.Background())
+			buckets, listerr := connectionList[username].ListBuckets(context.Background())
 			if listerr != nil {
 				delete(connectionList, username)
 				w.WriteHeader(http.StatusForbidden)
@@ -1568,6 +1633,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				w.Write([]byte(listerr.Error()))
 				return
 			}
+			bucketListCache.Store(username+"@"+te.Endpoint, buckets)
 
 		}
 

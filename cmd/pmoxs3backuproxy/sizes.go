@@ -52,6 +52,14 @@ var manifestCryptModeCache *ttlCache[map[string]string]
 // GetAsync.
 var datastoreUsageCache *ttlCache[DataStoreUsage]
 
+// Reporting enhancements are opt-in because they issue S3 reads which the
+// historical proxy did not perform. Operators of providers billing per API
+// call or byte must make that trade-off explicitly.
+var reportDataStoreUsage bool
+var reportArchiveSize bool
+var reportEncryption bool
+var reportGCStats bool
+
 // sizeLookupConcurrency bounds the parallel ranged GETs issued when sizes are
 // not cached yet, so that a cold cache does not open hundreds of connections
 // to the object store at once.

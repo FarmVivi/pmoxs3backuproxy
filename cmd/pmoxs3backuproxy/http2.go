@@ -103,6 +103,9 @@ func (s *Server) backup(sock net.Conn, C TicketEntry, ds string, S s3pmoxcommon.
 			s3backuplog.WarnPrint("Removed incomplete backup %s", snew.Snapshot.S3Prefix())
 		}
 	}
+	// A completed backup, a client abort, or a cleanup error can all leave a
+	// different set of objects in S3. This terminal hook covers every exit path.
+	publishDataStoreCacheInvalidation(ds)
 	s3backuplog.InfoPrint(
 		"backup session finished remote=%s datastore=%s backup_id=%s duration=%s complete=%t",
 		sock.RemoteAddr().String(),

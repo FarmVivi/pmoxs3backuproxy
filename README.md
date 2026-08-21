@@ -61,13 +61,14 @@ likely to happen with hosted S3 over slow network connections.
 
 ## Sizes shown in PVE frontend
 
-The size column of the backup list shows, by default, the logical size of the
-snapshot: the size of the guest disks it contains, which is what an index
-states in its header and what Proxmox Backup Server itself reports. It is not
-the space the snapshot occupies in the bucket, since chunks are shared between
-snapshots.
+The historical proxy reports the sizes already present in the S3 listing and
+does not issue extra reads merely to enrich the UI. Pass `-reportarchivesize`
+to report the logical size of the snapshot: the size of the guest disks it
+contains, which is what an index states in its header and what Proxmox Backup
+Server itself reports. It is not the space the snapshot occupies in the
+bucket, since chunks are shared between snapshots.
 
-`-snapshotsize` selects another figure:
+With `-reportgcstats`, `-snapshotsize` can select another figure:
 
 | Mode | Reports | Answers |
 |---|---|---|
@@ -79,7 +80,7 @@ snapshots.
 collector, so they are at most one collector run old, and a snapshot taken
 since the last run falls back to its logical size rather than showing zero.
 
-The usage gauge of the storage shows the real size of the bucket. Free space
+With `-reportdatastoreusage`, the usage gauge of the storage shows the real size of the bucket. Free space
 cannot be derived from S3: a bucket has no capacity to read back. Pass
 `-datastoresize` to declare one, otherwise a large free space is reported
 rather than showing a store with no quota as full.
@@ -111,7 +112,10 @@ Usage of ./pmoxs3backuproxy:
   -bind string
         PBS Protocol bind address, recommended 127.0.0.1:8007, use :8007 for all (default "127.0.0.1:8007")
   -bucketcachettl uint
-        Seconds a datastore (bucket) listing is reused before asking the S3 endpoint again, 0 disables caching (default 60)
+        Seconds a datastore (bucket) listing is reused before asking the S3 endpoint again, 0 disables caching (default 3600)
+
+  -cacheinvalidatedir string
+        Shared local directory for proxy/collector cache invalidation tokens; empty disables cross-process invalidation
   -cert string
         Server SSL certificate file (default "server.crt")
   -chunks3timeout uint
@@ -122,19 +126,36 @@ Usage of ./pmoxs3backuproxy:
         Debug logging
   -endpoint string
         S3 Endpoint without https/http , host:port
+  -gcstatscachettl uint
+        Seconds a garbage-collector usage report is cached after an opt-in read (default 3600)
   -key string
         Server SSL key file (default "server.key")
   -lookuptype string
         Bucket lookup type: auto,dns,path (default: "auto")
+  -metadatacachettl uint
+        Seconds archive sizes and encryption modes are cached after an opt-in metadata read (default 3600)
+  -reportarchivesize
+        Report logical archive sizes (adds one small ranged GET per uncached archive)
+  -reportdatastoreusage
+        Report real bucket usage in datastore status (adds periodic S3 metadata requests)
+  -reportencryption
+        Report client-side encryption modes (adds one manifest GET per uncached snapshot)
+  -reportgcstats
+        Read the garbage-collector usage report for referenced/exclusive snapshot sizes
   -snapshotsize string
         Size reported for a backup: logical (guest disk size), referenced (chunks it points at) or exclusive (chunks only it points at) (default "logical")
   -snapshotcachettl uint
-        Seconds a snapshot listing is reused before listing the bucket again, 0 disables caching (default 30)
+        Seconds a snapshot listing is reused before listing the bucket again, 0 disables caching (default 3600)
   -usagecachettl uint
-        Seconds before the used space of a datastore is recomputed in the background (default 60)
+        Seconds before the used space of a datastore is recomputed in the background (default 3600)
   -usessl
         Enable SSL connection to the endpoint, for use with cloud S3 providers
 ```
+
+The four `-report*` switches are deliberately disabled by default. This keeps
+the S3 request profile compatible with the historical proxy for operators on
+providers which charge per GET, listing, or byte. Bucket and snapshot caches
+only reduce requests the proxy already had to make.
 
 Proxmox VE polls this API constantly - pvestatd refreshes every storage every
 10 seconds - and gives it 7 seconds to answer, a timeout hardcoded in
@@ -143,6 +164,13 @@ such as the used space are refreshed in the background rather than on the
 request path. Without that, a transient slowdown of the object store makes
 `vzdump` fail its pre-flight check with `error fetching datastores - 500 read
 timeout` and abort the whole backup job.
+
+Mutable caches default to one hour and are invalidated at every terminal
+mutation: completed or interrupted backup, incomplete-snapshot cleanup,
+snapshot deletion, notes/protection changes, and garbage collection. Pass the
+same writable `-cacheinvalidatedir` to the proxy and collector to propagate GC
+changes without polling S3. Changes made by an unrelated external S3 client
+cannot be observed event-by-event and remain bounded by the TTL.
 
 Concurrent requests for the same content-addressed chunk are coalesced into a
 single S3 operation. Duplicate HTTP/2 request bodies are still drained while
@@ -157,6 +185,8 @@ Usage of ./garbagecollector:
         S3 Access Key ID
   -bucket string
         Bucket to perform garbage collection on
+  -cacheinvalidatedir string
+        Shared local directory for collector/proxy cache invalidation tokens; empty disables notification
   -chunkgrace uint
         Hours a chunk is protected from orphan removal after being written, 0 disables the protection (default 24)
   -debug
@@ -297,4 +327,4 @@ Garbage collector will also check for integrity ( only the presence of all
 referenced chunks ), if a backup is found to be broken, it will not be deleted
 and retention will be honored, but it will be marked corrupted, so next backup
 from PVE will be non incremental and will recreate missing chunk if needed.
-Corrupted backup will not appear in PVE backup list
+Corrupted backup will not appear in PVE backup list.

@@ -145,6 +145,44 @@ func TestTTLCacheInvalidate(t *testing.T) {
 	}
 }
 
+func TestTTLCacheStoreReusesMandatoryUpstreamResult(t *testing.T) {
+	c := newTTLCache[int](time.Hour)
+	c.Store("k", 41)
+	value, fresh, err := c.Get("k", func() (int, error) {
+		t.Fatal("cached mandatory result unexpectedly fetched again")
+		return 0, nil
+	})
+	if err != nil || fresh || value != 41 {
+		t.Fatalf("stored value: got (%d, %v, %v), want (41, false, nil)", value, fresh, err)
+	}
+}
+
+func TestTTLCacheInvalidatePrefix(t *testing.T) {
+	c := newTTLCache[int](time.Hour)
+	c.Store("bucket-a/one", 1)
+	c.Store("bucket-a/two", 2)
+	c.Store("bucket-b/one", 3)
+	c.InvalidatePrefix("bucket-a/")
+
+	calls := 0
+	for _, key := range []string{"bucket-a/one", "bucket-a/two"} {
+		_, fresh, err := c.Get(key, func() (int, error) {
+			calls++
+			return 9, nil
+		})
+		if err != nil || !fresh {
+			t.Fatalf("%s was not invalidated: fresh=%v err=%v", key, fresh, err)
+		}
+	}
+	value, fresh, err := c.Get("bucket-b/one", func() (int, error) {
+		t.Fatal("unrelated prefix was invalidated")
+		return 0, nil
+	})
+	if err != nil || fresh || value != 3 || calls != 2 {
+		t.Fatalf("unrelated value: got (%d, %v, %v), invalidated calls=%d", value, fresh, err, calls)
+	}
+}
+
 func TestTTLCacheExpirePreservesStaleValueDuringAsyncRefresh(t *testing.T) {
 	c := newTTLCache[int](time.Minute)
 	if _, _, err := c.Get("k", func() (int, error) { return 7, nil }); err != nil {
@@ -173,6 +211,43 @@ func TestTTLCacheExpirePreservesStaleValueDuringAsyncRefresh(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("background refresh did not replace the stale value")
+}
+
+func TestTTLCacheInvalidationRejectsOlderAsyncRefresh(t *testing.T) {
+	c := newTTLCache[int](time.Hour)
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	if _, known := c.GetAsync("k", func() (int, error) {
+		close(started)
+		<-release
+		return 1, nil
+	}); known {
+		t.Fatal("cold asynchronous cache unexpectedly had a value")
+	}
+	<-started
+	c.Invalidate("k")
+	close(release)
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		entry := c.entry("k")
+		entry.mu.Lock()
+		refreshing := entry.refreshing
+		entry.mu.Unlock()
+		if !refreshing {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if value, ok := c.Peek("k"); ok {
+		t.Fatalf("pre-invalidation refresh resurrected stale value %d", value)
+	}
+
+	value, fresh, err := c.Get("k", func() (int, error) { return 2, nil })
+	if err != nil || !fresh || value != 2 {
+		t.Fatalf("post-invalidation refresh: got (%d, %v, %v), want (2, true, nil)", value, fresh, err)
+	}
 }
 
 func TestWaitForDataStoreUsage(t *testing.T) {

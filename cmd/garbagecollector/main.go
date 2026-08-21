@@ -92,6 +92,10 @@ func main() {
 		"chunkgrace", 24,
 		"Hours a chunk is protected from orphan removal after being written, 0 disables the protection",
 	)
+	cacheInvalidationDir := flag.String(
+		"cacheinvalidatedir", "",
+		"Shared local directory for collector/proxy cache invalidation tokens; empty disables notification",
+	)
 	flag.BoolVar(&printVersion, "version", false, "Show version and exit")
 	flag.BoolVar(&printVersion, "v", false, "Show version and exit")
 
@@ -150,6 +154,13 @@ func main() {
 	s3backuplog.DebugPrint("Locked %s", lockname)
 
 	ctx := context.Background()
+	publishInvalidation := func() {
+		if _, err := s3pmoxcommon.PublishCacheInvalidation(
+			*cacheInvalidationDir, *endpointFlag, *bucketFlag,
+		); err != nil {
+			s3backuplog.WarnPrint("Unable to publish cache invalidation for [%s]: %s", *bucketFlag, err)
+		}
+	}
 	bucket, staterr := minioClient.BucketExists(ctx, *bucketFlag)
 	if staterr != nil {
 		s3backuplog.FatalPrint("Unable to access specified bucket: %s", staterr.Error())
@@ -233,8 +244,12 @@ func main() {
 				); err != nil {
 					s3backuplog.FatalPrint("Error tagging %s as corrupt: %s", objectName, err)
 				}
+				publishInvalidation()
 			}
 		}
+		// Corruption markers changed the snapshot listing even though the GC
+		// deliberately refuses to sweep anything in this run.
+		publishInvalidation()
 		s3backuplog.FatalPrint(
 			"Integrity check found %d missing referenced chunks; nothing was deleted",
 			len(plan.missingChunks),
@@ -252,9 +267,14 @@ func main() {
 	for _, snapshot := range plan.expiredSnapshots {
 		s3backuplog.InfoPrint("Backup %s is older than %d days, deleting", snapshot.S3Prefix(), *retentionDays)
 	}
+	// Mark before and after the sweep. The second notification is also emitted
+	// on a partial failure, after RemoveObjects has reported it.
+	publishInvalidation()
 	if err := executeGCPlan(ctx, minioClient, *bucketFlag, plan); err != nil {
+		publishInvalidation()
 		s3backuplog.FatalPrint("Garbage-collection sweep failed: %s", err)
 	}
+	publishInvalidation()
 	if plan.protectedByGrace > 0 {
 		s3backuplog.InfoPrint(
 			"%d unreferenced chunks kept, written less than %d hours ago",
@@ -270,6 +290,7 @@ func main() {
 		plan.chunkSizes,
 		plan.archiveSizes,
 	)
+	publishInvalidation()
 
 	s3backuplog.InfoPrint("Finished")
 	SessionsRelease.Release()
