@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"sync"
@@ -46,7 +47,7 @@ func parseChunkRequest(r *http.Request) (chunkRequest, error) {
 	}
 
 	size, err := strconv.ParseUint(q.Get("size"), 10, 64)
-	if err != nil || size == 0 {
+	if err != nil || size == 0 || size > math.MaxInt64 {
 		return chunkRequest{}, fmt.Errorf("invalid chunk size %q", q.Get("size"))
 	}
 	wid, err := strconv.ParseInt(q.Get("wid"), 10, 32)

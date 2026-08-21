@@ -66,6 +66,7 @@ func TestParseChunkRequestRejectsMalformedInput(t *testing.T) {
 		{"content length mismatch", "2", "1", "1", testDigest, 1},
 		{"missing logical size", "1", "", "1", testDigest, 1},
 		{"zero logical size", "1", "0", "1", testDigest, 1},
+		{"logical size over int64", "1", "9223372036854775808", "1", testDigest, 1},
 		{"invalid writer", "1", "1", "invalid", testDigest, 1},
 		{"negative writer", "1", "1", "-1", testDigest, 1},
 		{"writer overflow", "1", "1", "2147483648", testDigest, 1},
