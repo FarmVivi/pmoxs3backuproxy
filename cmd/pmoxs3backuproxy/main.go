@@ -572,6 +572,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				GCState: true, // todo
 			}
 			if known {
+				if usage.Snapshots == 0 {
+					// The accounting shortcut does not count snapshots. Report
+					// them when a listing happens to be cached, rather than
+					// walking the bucket for a cosmetic figure.
+					if snapshots, ok := snapshotListCache.Peek(ds); ok {
+						usage.Snapshots = uint64(len(snapshots))
+					}
+				}
 				avail := unknownDataStoreCapacity
 				if datastoreCapacity > usage.Bytes {
 					avail = datastoreCapacity - usage.Bytes

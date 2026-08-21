@@ -158,6 +158,16 @@ func (c *ttlCache[T]) GetAsync(key string, fetch func() (T, error)) (T, bool) {
 	return value, valid
 }
 
+// Peek returns what is cached for key, fresh or stale, without ever calling
+// upstream. It exists for figures that are nice to report when they happen to
+// be known and not worth a request otherwise.
+func (c *ttlCache[T]) Peek(key string) (T, bool) {
+	e := c.entry(key)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.value, e.valid
+}
+
 // Invalidate drops the entry for key, so the next Get calls upstream again.
 // Used when the proxy itself mutated the underlying state and does not want to
 // wait out the TTL.
