@@ -76,7 +76,7 @@ func TestIntegrationBucketHeaderUsage(t *testing.T) {
 func TestIntegrationArchiveSizes(t *testing.T) {
 	C, bucket := newIntegrationClient(t)
 
-	snapshots, err := s3pmoxcommon.ListSnapshots(*C.Client, bucket, false)
+	snapshots, err := s3pmoxcommon.ListSnapshots(C.Client, bucket, false)
 	if err != nil {
 		t.Fatalf("unable to list snapshots: %v", err)
 	}

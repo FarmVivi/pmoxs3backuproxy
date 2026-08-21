@@ -4,8 +4,10 @@ Runtime and build inputs are pinned so a rebuild does not silently select a
 different dependency:
 
 - Go modules are locked by `go.mod` and `go.sum`; the Go version is exact.
-- Docker base and CI images use explicit version tags. The runtime stage is
-  `scratch`, so it has no package or image version.
+- Docker base and CI images use explicit version tags whenever the publisher
+  provides them. The free `cgr.dev/chainguard/static` image exposes only
+  `latest`; access to version-specific tags requires a Chainguard catalogue
+  subscription, so it is the documented exception.
 - GitHub Actions use explicit release tags, including patch versions.
 - GoReleaser, MinIO, and the direct Proxmox CI packages use exact versions.
 - The downloaded Proxmox repository key is verified with SHA-256.

@@ -4,9 +4,9 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     env:
-      # renovate: datasource=docker depName=minio/minio versioning=docker
+      # renovate: datasource=docker depName=minio/minio versioning=regex:^RELEASE\.(?<major>\d{4})-(?<minor>\d{2})-(?<patch>\d{2})T(?<build>\d{2})-(?<revision>\d{2})-\d{2}Z$
       MINIO_IMAGE: minio/minio:RELEASE.2025-09-07T16-13-09Z
-      # renovate: datasource=docker depName=minio/mc versioning=docker
+      # renovate: datasource=docker depName=minio/mc versioning=regex:^RELEASE\.(?<major>\d{4})-(?<minor>\d{2})-(?<patch>\d{2})T(?<build>\d{2})-(?<revision>\d{2})-\d{2}Z$
       MINIO_MC_IMAGE: minio/mc:RELEASE.2025-08-13T08-35-41Z
       # renovate: datasource=deb depName=proxmox-backup-client
       PROXMOX_BACKUP_CLIENT_VERSION: 3.4.7-1

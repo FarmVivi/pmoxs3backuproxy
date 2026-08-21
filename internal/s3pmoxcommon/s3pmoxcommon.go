@@ -23,7 +23,7 @@ func DataStoreLockName(endpoint string, datastore string) string {
 	return "PBSS3" + hex.EncodeToString(h[:])[:16]
 }
 
-func ListSnapshots(c minio.Client, datastore string, returnCorrupted bool) ([]Snapshot, error) {
+func ListSnapshots(c *minio.Client, datastore string, returnCorrupted bool) ([]Snapshot, error) {
 	ctx := context.Background()
 	objects := make([]minio.ObjectInfo, 0)
 	for object := range c.ListObjects(
@@ -112,7 +112,7 @@ func SnapshotsFromObjects(objects []minio.ObjectInfo, datastore string, returnCo
 	return result, nil
 }
 
-func GetLatestSnapshot(c minio.Client, ds string, id string, time uint64) (*Snapshot, error) {
+func GetLatestSnapshot(c *minio.Client, ds string, id string, time uint64) (*Snapshot, error) {
 	snapshots, err := ListSnapshots(c, ds, false)
 	if err != nil {
 		s3backuplog.ErrorPrint(err.Error())
@@ -158,7 +158,7 @@ func (S *Snapshot) S3Prefix() string {
 	return fmt.Sprintf("backups/%s|%d|%s", S.BackupID, S.BackupTime, S.BackupType)
 }
 
-func (S *Snapshot) GetFiles(c minio.Client) {
+func (S *Snapshot) GetFiles(c *minio.Client) {
 	for object := range c.ListObjects(
 		context.Background(), S.Datastore,
 		minio.ListObjectsOptions{Recursive: true, Prefix: S.S3Prefix()},
@@ -172,7 +172,7 @@ func (S *Snapshot) GetFiles(c minio.Client) {
 	}
 }
 
-func (S *Snapshot) ReadTags(c minio.Client) (map[string]string, error) {
+func (S *Snapshot) ReadTags(c *minio.Client) (map[string]string, error) {
 	existingTags, err := c.GetObjectTagging(
 		context.Background(),
 		S.Datastore,
@@ -186,7 +186,7 @@ func (S *Snapshot) ReadTags(c minio.Client) (map[string]string, error) {
 	return existingTags.ToMap(), nil
 }
 
-func (S *Snapshot) Delete(c minio.Client) error {
+func (S *Snapshot) Delete(c *minio.Client) error {
 	ctx := context.Background()
 	objects := make([]minio.ObjectInfo, 0)
 	// The trailing slash makes the boundary explicit. Without it, an unusual

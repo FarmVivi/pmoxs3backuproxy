@@ -331,7 +331,7 @@ func main() {
 // GetLatestSnapshot must always observe the real state of the bucket.
 func listSnapshotsCached(c *minio.Client, datastore string) ([]s3pmoxcommon.Snapshot, error) {
 	snapshots, _, err := snapshotListCache.Get(datastore, func() ([]s3pmoxcommon.Snapshot, error) {
-		s, err := s3pmoxcommon.ListSnapshots(*c, datastore, false)
+		s, err := s3pmoxcommon.ListSnapshots(c, datastore, false)
 		if err != nil {
 			return nil, err
 		}
@@ -465,7 +465,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			var ss s3pmoxcommon.Snapshot
 			ss.InitWithQuery(r.URL.Query())
 			ss.Datastore = ds
-			existingTags, err := ss.ReadTags(*C.Client)
+			existingTags, err := ss.ReadTags(C.Client)
 			if err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
 				w.Write([]byte(err.Error()))
@@ -490,7 +490,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ss.Datastore = ds
 			note := r.FormValue("notes")
 			note = base64.RawStdEncoding.EncodeToString([]byte(note))
-			existingTags, _ := ss.ReadTags(*C.Client)
+			existingTags, _ := ss.ReadTags(C.Client)
 			existingTags["note"] = note
 			tag, _ = tags.NewTags(existingTags, false)
 			err := C.Client.PutObjectTagging(
@@ -513,7 +513,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			var ss s3pmoxcommon.Snapshot
 			ss.InitWithQuery(r.URL.Query())
 			ss.Datastore = ds
-			ss.GetFiles(*C.Client)
+			ss.GetFiles(C.Client)
 			filesSnapshot := []s3pmoxcommon.Snapshot{ss}
 			if reportEncryption {
 				FillSnapshotCryptModes(C.Client, filesSnapshot)
@@ -533,7 +533,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ss.InitWithQuery(r.URL.Query())
 			ss.Datastore = ds
 			w.Header().Add("Content-Type", "application/json")
-			existingTags, err := ss.ReadTags(*C.Client)
+			existingTags, err := ss.ReadTags(C.Client)
 			if err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
 				w.Write([]byte(err.Error()))
@@ -558,7 +558,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			var tag *tags.Tags
 			ss.InitWithForm(r)
 			ss.Datastore = ds
-			existingTags, err := ss.ReadTags(*C.Client)
+			existingTags, err := ss.ReadTags(C.Client)
 			if err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
 				w.Write([]byte(err.Error()))
@@ -801,7 +801,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				ss.Datastore = ds
 				s3backuplog.InfoPrint("Removing snapshot: %s as requested by user", ss.S3Prefix())
 				invalidateDataStoreCachesLocal(ds)
-				if err := ss.Delete(*C.Client); err == nil {
+				if err := ss.Delete(C.Client); err == nil {
 					publishDataStoreCacheInvalidation(ds)
 					w.Header().Add("Content-Type", "application/json")
 					resp, _ := json.Marshal(Response{
@@ -871,7 +871,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasPrefix(r.RequestURI, "/previous_backup_time") && s.H2Ticket != nil && r.Method == "GET" {
 		mostRecent, err := s3pmoxcommon.GetLatestSnapshot(
-			*s.H2Ticket.Client,
+			s.H2Ticket.Client,
 			*s.SelectedDataStore,
 			s.Snapshot.BackupID,
 			s.Snapshot.BackupTime,
@@ -899,7 +899,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(r.RequestURI, "/previous?") && s.H2Ticket != nil && r.Method == "GET" {
 		s3backuplog.InfoPrint("Handling get request for previous (%s)", r.URL.Query().Get("archive-name"))
 		mostRecent, err := s3pmoxcommon.GetLatestSnapshot(
-			*s.H2Ticket.Client,
+			s.H2Ticket.Client,
 			*s.SelectedDataStore,
 			s.Snapshot.BackupID,
 			s.Snapshot.BackupTime,
