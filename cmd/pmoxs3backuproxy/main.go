@@ -1205,21 +1205,77 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			defer cancel()
 		}
 
+		started := time.Now()
+		role := "leader"
+		s3backuplog.DebugPrint(
+			"chunk request started datastore=%s digest=%s writer=%d encoded_bytes=%d logical_bytes=%d",
+			*s.SelectedDataStore,
+			request.Digest,
+			request.WriterID,
+			request.EncodedSize,
+			request.Size,
+		)
 		known, uploadErr := chunkUploads.Do(
 			ctx,
 			*s.SelectedDataStore+"/"+request.ObjectName,
 			func() (bool, error) {
-				return storeChunk(ctx, s.H2Ticket.Client, *s.SelectedDataStore, request, r.Body)
+				known, err := storeChunk(ctx, s.H2Ticket.Client, *s.SelectedDataStore, request, r.Body)
+				s3backuplog.DebugPrint(
+					"chunk leader finished datastore=%s digest=%s known=%t duration=%s err=%v",
+					*s.SelectedDataStore,
+					request.Digest,
+					known,
+					time.Since(started).Round(time.Millisecond),
+					err,
+				)
+				return known, err
 			},
 			func() error {
+				role = "follower"
+				s3backuplog.DebugPrint(
+					"duplicate chunk draining body datastore=%s digest=%s encoded_bytes=%d",
+					*s.SelectedDataStore,
+					request.Digest,
+					request.EncodedSize,
+				)
 				return drainChunkBody(r.Body, request.EncodedSize)
 			},
 		)
+		duration := time.Since(started)
 
 		if uploadErr != nil {
-			s3backuplog.ErrorPrint("Writing object %s failed: %s", request.Digest, uploadErr)
+			s3backuplog.ErrorPrint(
+				"chunk request failed datastore=%s digest=%s writer=%d role=%s duration=%s err=%s",
+				*s.SelectedDataStore,
+				request.Digest,
+				request.WriterID,
+				role,
+				duration.Round(time.Millisecond),
+				uploadErr,
+			)
 			http.Error(w, uploadErr.Error(), http.StatusInternalServerError)
 			return
+		}
+		if duration >= 30*time.Second {
+			s3backuplog.WarnPrint(
+				"slow chunk request datastore=%s digest=%s writer=%d role=%s duration=%s known=%t",
+				*s.SelectedDataStore,
+				request.Digest,
+				request.WriterID,
+				role,
+				duration.Round(time.Millisecond),
+				known,
+			)
+		} else {
+			s3backuplog.DebugPrint(
+				"chunk request completed datastore=%s digest=%s writer=%d role=%s duration=%s known=%t",
+				*s.SelectedDataStore,
+				request.Digest,
+				request.WriterID,
+				role,
+				duration.Round(time.Millisecond),
+				known,
+			)
 		}
 		// Here chunk size is derived. Several chunks may arrive concurrently.
 		atomic.CompareAndSwapUint64(&writer.Chunksize, 0, request.Size)

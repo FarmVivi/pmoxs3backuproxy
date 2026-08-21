@@ -14,6 +14,7 @@ import (
 )
 
 func (s *Server) backup(sock net.Conn, C TicketEntry, ds string, S s3pmoxcommon.Snapshot) {
+	started := time.Now()
 	s.SessionsMutex.Lock()
 	if s.Sessions == 0 {
 		h := sha256.Sum256([]byte(C.Endpoint + "|" + ds))
@@ -48,6 +49,13 @@ func (s *Server) backup(sock net.Conn, C TicketEntry, ds string, S s3pmoxcommon.
 	}
 	srv.ServeConn(sock, &http2.ServeConnOpts{Handler: snew})
 	if !snew.Finished { //Incomplete backup because connection died pve side, remove from S3
+		s3backuplog.WarnPrint(
+			"backup session incomplete remote=%s datastore=%s backup_id=%s duration=%s",
+			sock.RemoteAddr(),
+			ds,
+			S.BackupID,
+			time.Since(started).Round(time.Millisecond),
+		)
 		S.Datastore = ds
 		if err := S.Delete(*C.Client); err != nil {
 			s3backuplog.ErrorPrint("Failed to remove incomplete backup: " + err.Error())
@@ -62,12 +70,17 @@ func (s *Server) backup(sock net.Conn, C TicketEntry, ds string, S s3pmoxcommon.
 	}
 	s.SessionsMutex.Unlock()
 	s3backuplog.InfoPrint(
-		"Backup session by [%s] finished",
+		"backup session finished remote=%s datastore=%s backup_id=%s duration=%s complete=%t",
 		sock.RemoteAddr().String(),
+		ds,
+		S.BackupID,
+		time.Since(started).Round(time.Millisecond),
+		snew.Finished,
 	)
 }
 
 func (s *Server) restore(sock net.Conn, C TicketEntry, ds string, S s3pmoxcommon.Snapshot) {
+	started := time.Now()
 	s.SessionsMutex.Lock()
 	if s.Sessions == 0 {
 		h := sha256.Sum256([]byte(C.Endpoint + C.AccessKeyID + ds))
@@ -107,7 +120,10 @@ func (s *Server) restore(sock net.Conn, C TicketEntry, ds string, S s3pmoxcommon
 	}
 	s.SessionsMutex.Unlock()
 	s3backuplog.InfoPrint(
-		"Restore session by [%s] finished",
+		"restore session finished remote=%s datastore=%s backup_id=%s duration=%s",
 		sock.RemoteAddr().String(),
+		ds,
+		S.BackupID,
+		time.Since(started).Round(time.Millisecond),
 	)
 }
