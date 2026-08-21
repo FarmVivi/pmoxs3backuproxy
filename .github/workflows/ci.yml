@@ -34,6 +34,7 @@ jobs:
         run: |
           go get github.com/elbandi/go-proxmox-backup-client
           go get github.com/schollz/progressbar/v3
+          go test -race ./cmd/... ./internal/...
           go build  tizbac/pmoxs3backuproxy/cmd/pmoxs3backuproxy
           go build  tizbac/pmoxs3backuproxy/cmd/garbagecollector
           go build -o fdxtest tizbac/pmoxs3backuproxy/test
@@ -46,6 +47,9 @@ jobs:
           export ENDPOINT="127.0.0.1:9000"
           export PBS_FINGERPRINT="55:BC:29:4B:BA:B6:A1:03:42:A9:D8:51:14:9D:BD:00:D2:2A:9C:A1:B8:4A:85:E1:AF:B2:0C:48:40:D6:CC:A4"
           export PBS_REPOSITORY="$USERNAME@pbs@127.0.0.1:$BUCKET"
+          S3TEST_ENDPOINT="$ENDPOINT" S3TEST_BUCKET="$BUCKET" \
+            S3TEST_ACCESSKEY="$USERNAME" S3TEST_SECRETKEY="$PBS_PASSWORD" \
+            go test ./cmd/pmoxs3backuproxy -run TestIntegrationConcurrentChunkUpload -v
           echo "start proxy"
           nohup ./pmoxs3backuproxy -endpoint $ENDPOINT -bind 127.0.0.1:8007 -debug > /tmp/nohup.out 2> /tmp/nohup.err < /dev/null &
           echo "create first backup"
