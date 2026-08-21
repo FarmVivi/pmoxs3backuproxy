@@ -24,8 +24,25 @@ func (s *Server) handleSignal() {
 					signalcnt += 1
 					continue
 				}
+				/**
+				 * Asking the process to stop is not a failure. Exiting non
+				 * zero here made every restart of the service look like a
+				 * crash in the journal, which is worse than cosmetic: it
+				 * makes a real crash indistinguishable from a deployment.
+				 *
+				 * Being forced out while sessions are still running is a
+				 * different matter, as it aborts backups in flight, and
+				 * keeps a failure status.
+				 **/
+				if s.Sessions > 0 {
+					s3backuplog.WarnPrint(
+						"Received signal %d, forced exit with %d sessions still active",
+						sig, s.Sessions,
+					)
+					os.Exit(1)
+				}
 				s3backuplog.InfoPrint("Received signal %d, exiting", sig)
-				os.Exit(1)
+				os.Exit(0)
 			}
 		}
 	}()
