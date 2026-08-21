@@ -61,7 +61,36 @@ likely to happen with hosted S3 over slow network connections.
 
 ## Sizes shown in PVE frontend
 
-The backup size is currently not correctly shown
+The size column of the backup list shows the logical size of the snapshot, the
+size of the guest disks it contains, which is what an index states in its
+header. It is not the space the snapshot occupies in the bucket: chunks are
+shared between snapshots, so the sum of the snapshot sizes is much larger than
+the bucket itself.
+
+The usage gauge of the storage shows the real size of the bucket. Free space
+cannot be derived from S3: a bucket has no capacity to read back. Pass
+`-datastoresize` to declare one, otherwise a large free space is reported
+rather than showing a store with no quota as full.
+
+Deduplication figures - what a snapshot references, and what deleting it would
+actually free - are computed by the garbage collector and stored in the bucket
+as `usage-stats.json`. They cannot be produced on demand, since knowing what a
+snapshot holds exclusively means resolving the chunk references of every other
+snapshot. Read them back with:
+
+```
+GET /api2/json/admin/datastore/<datastore>/s3stats
+```
+
+## Deleting a backup does not free the space immediately
+
+Deleting a snapshot, from the PVE interface or otherwise, removes the objects
+of that snapshot only: its indexes, its blobs and its log. The chunks holding
+the data are shared with other snapshots and are never removed at that point.
+
+They are reclaimed by the garbage collector, which keeps every chunk that any
+remaining index still references. Space therefore comes back at the next
+collector run, not at deletion time.
 
 # Usage
 
@@ -69,8 +98,12 @@ The backup size is currently not correctly shown
 Usage of ./pmoxs3backuproxy:
   -bind string
         PBS Protocol bind address, recommended 127.0.0.1:8007, use :8007 for all (default "127.0.0.1:8007")
+  -bucketcachettl uint
+        Seconds a datastore (bucket) listing is reused before asking the S3 endpoint again, 0 disables caching (default 60)
   -cert string
         Server SSL certificate file (default "server.crt")
+  -datastoresize uint
+        Capacity of the datastore in bytes, used to report free space, 0 if the bucket has no quota
   -debug
         Debug logging
   -endpoint string
@@ -79,9 +112,21 @@ Usage of ./pmoxs3backuproxy:
         Server SSL key file (default "server.key")
   -lookuptype string
         Bucket lookup type: auto,dns,path (default: "auto")
+  -snapshotcachettl uint
+        Seconds a snapshot listing is reused before listing the bucket again, 0 disables caching (default 30)
+  -usagecachettl uint
+        Seconds before the used space of a datastore is recomputed in the background (default 900)
   -usessl
         Enable SSL connection to the endpoint, for use with cloud S3 providers
 ```
+
+Proxmox VE polls this API constantly - pvestatd refreshes every storage every
+10 seconds - and gives it 7 seconds to answer, a timeout hardcoded in
+`PVE::Storage::PBSPlugin`. Listings are therefore cached, and expensive figures
+such as the used space are refreshed in the background rather than on the
+request path. Without that, a transient slowdown of the object store makes
+`vzdump` fail its pre-flight check with `error fetching datastores - 500 read
+timeout` and abort the whole backup job.
 
 ```
 Usage of ./garbagecollector:
@@ -89,6 +134,8 @@ Usage of ./garbagecollector:
         S3 Access Key ID
   -bucket string
         Bucket to perform garbage collection on
+  -chunkgrace uint
+        Hours a chunk is protected from orphan removal after being written, 0 disables the protection (default 24)
   -debug
         Debug logging
   -endpoint string
@@ -105,6 +152,16 @@ Usage of ./garbagecollector:
         Use SSL for endpoint connection: default: false
 
 ```
+
+A chunk is uploaded before the index referencing it is written, so the chunks
+of a backup that is still running are indistinguishable from orphans. The
+collector therefore leaves recently written chunks alone and collects them on a
+later run; `-chunkgrace` sets how recent is recent enough. Do not disable it
+unless no backup can possibly run at the same time.
+
+Each run also writes `usage-stats.json` at the root of the bucket, holding for
+every snapshot its logical size, the size of the chunks it references and the
+size of the chunks no other snapshot references.
 
 # Quickstart
 ### Setup minio

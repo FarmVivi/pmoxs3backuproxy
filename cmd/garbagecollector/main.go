@@ -195,6 +195,13 @@ func main() {
 	knownHashes := make(map[string]bool)
 	knownChunks := make(map[string][]string)
 	existingChunks := make(map[string]bool)
+	// Size of every chunk that survived the sweep, gathered from the listing
+	// that the sweep performs anyway. This is what makes the usage report
+	// below free: no extra request, no download.
+	chunkSizes := make(map[string]uint64)
+	// Logical size of each archive, read from the index headers that the mark
+	// phase already loads in memory.
+	archiveSizes := make(map[string]uint64)
 	s3backuplog.InfoPrint("Fetching object hashes")
 	for object := range minioClient.ListObjects(ctx, *bucketFlag, minio.ListObjectsOptions{
 		Recursive:    true,
@@ -257,6 +264,8 @@ func main() {
 				s3backuplog.FatalPrint("%s", csumerr.Error())
 			}
 
+			archiveSizes[object.Key] = binary.LittleEndian.Uint64(data[64:72])
+
 			data = data[4096:]
 			if len(data)%32 != 0 {
 				s3backuplog.FatalPrint("Error examining object %s: Data after header length is not 32 bytes aligned", object.Key)
@@ -288,6 +297,15 @@ func main() {
 			}
 			if csumerr := compareSum(data[32:64], data[4096:], getObjectMetdata(ctx, *bucketFlag, object, minioClient)); csumerr != nil {
 				s3backuplog.FatalPrint("%s", csumerr.Error())
+			}
+
+			if len(data) > 4096 {
+				// A dynamic index states the archive size in the end offset
+				// of its last entry, entries being 40 bytes each.
+				last := 4096 + ((len(data)-4096)/40-1)*40
+				if last >= 4096 && last+8 <= len(data) {
+					archiveSizes[object.Key] = binary.LittleEndian.Uint64(data[last : last+8])
+				}
 			}
 
 			reader := bytes.NewReader(data[4096:])
@@ -356,6 +374,7 @@ func main() {
 			} else {
 				s3backuplog.DebugPrint("Chunk still referenced: %s, skip removal", chunkhash)
 				existingChunks[chunkhash] = true
+				chunkSizes[chunkhash] = uint64(object.Size)
 			}
 		}
 	}()
@@ -391,6 +410,8 @@ func main() {
 			}
 		}
 	}
+	writeUsageStats(ctx, minioClient, *bucketFlag, knownChunks, chunkSizes, archiveSizes)
+
 	s3backuplog.InfoPrint("Finished")
 	SessionsRelease.Release()
 }
