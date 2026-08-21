@@ -177,6 +177,7 @@ func storeChunk(
 	bucket string,
 	request chunkRequest,
 	body io.Reader,
+	storageClass string,
 ) (bool, error) {
 	_, err := store.StatObject(ctx, bucket, request.ObjectName, minio.StatObjectOptions{})
 	if err == nil {
@@ -196,7 +197,7 @@ func storeChunk(
 		request.ObjectName,
 		counted,
 		request.EncodedSize,
-		minio.PutObjectOptions{},
+		putOptions(storageClass, nil),
 	); err != nil {
 		return false, fmt.Errorf("put chunk %s: %w", request.Digest, err)
 	}

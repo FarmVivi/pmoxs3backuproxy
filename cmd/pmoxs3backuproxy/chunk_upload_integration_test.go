@@ -121,7 +121,7 @@ func TestIntegrationConcurrentChunkUpload(t *testing.T) {
 				ctx,
 				bucket+"/"+request.ObjectName,
 				func() (bool, error) {
-					return storeChunk(ctx, store, bucket, request, reader)
+					return storeChunk(ctx, store, bucket, request, reader, "")
 				},
 				func() error {
 					return drainChunkBody(reader, request.EncodedSize)
