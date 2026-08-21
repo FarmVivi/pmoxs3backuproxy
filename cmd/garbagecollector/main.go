@@ -68,6 +68,20 @@ func getObjectMetdata(ctx context.Context, bucketFlag string, object minio.Objec
 	return csum
 }
 
+// withinGracePeriod reports whether an unreferenced chunk is too young to be
+// removed safely.
+//
+// Chunks are uploaded before the index that references them is written, so a
+// chunk belonging to a running backup is indistinguishable from an orphan.
+// Keeping the recent ones lets the next run collect them, once their index
+// exists.
+func withinGracePeriod(lastModified time.Time, now time.Time, grace time.Duration) bool {
+	if grace <= 0 {
+		return false
+	}
+	return lastModified.After(now.Add(-grace))
+}
+
 func main() {
 	var printVersion bool
 	endpointFlag := flag.String("endpoint", "", "S3 Endpoint without https/http , host:port")
@@ -77,6 +91,10 @@ func main() {
 	secretKey := flag.String("secretkey", "", "S3 Secret Key, discouraged , use a file if possible")
 	secretKeyFile := flag.String("secretkeyfile", "", "S3 Secret Key File")
 	retentionDays := flag.Uint("retention", 60, "Number of days to keep backups for")
+	chunkGraceHours := flag.Uint(
+		"chunkgrace", 24,
+		"Hours a chunk is protected from orphan removal after being written, 0 disables the protection",
+	)
 	flag.BoolVar(&printVersion, "version", false, "Show version and exit")
 	flag.BoolVar(&printVersion, "v", false, "Show version and exit")
 
@@ -302,6 +320,21 @@ func main() {
 	s3backuplog.InfoPrint("Enumerated %d referenced chunks", len(knownChunks))
 	//Delete orphaned chunks
 
+	/**
+	 * A chunk is uploaded before the index that references it is written, so
+	 * a chunk belonging to a backup that is still running looks exactly like
+	 * an orphan: nothing points at it yet. Deleting it would silently corrupt
+	 * that backup, and the local mutex above only excludes other collector
+	 * runs, never the proxy.
+	 *
+	 * Like Proxmox Backup Server does, recently written chunks are therefore
+	 * left alone. They are collected by the next run, once their index exists
+	 * and marks them as referenced.
+	 **/
+	gracePeriod := time.Duration(*chunkGraceHours) * time.Hour
+	graceNow := time.Now()
+	var protectedByGrace uint64
+
 	objectsCh = make(chan minio.ObjectInfo)
 	go func() {
 		defer close(objectsCh)
@@ -309,6 +342,16 @@ func main() {
 			chunkhash := strings.ReplaceAll(object.Key[7:], "/", "")
 			_, ok := knownChunks[chunkhash]
 			if !ok {
+				if withinGracePeriod(object.LastModified, graceNow, gracePeriod) {
+					s3backuplog.DebugPrint(
+						"Chunk %s is unreferenced but was written %s ago, within the %d hours grace period, skip removal",
+						chunkhash,
+						time.Since(object.LastModified).Truncate(time.Second),
+						*chunkGraceHours,
+					)
+					protectedByGrace++
+					continue
+				}
 				objectsCh <- object
 			} else {
 				s3backuplog.DebugPrint("Chunk still referenced: %s, skip removal", chunkhash)
@@ -321,6 +364,13 @@ func main() {
 	errorCh = minioClient.RemoveObjects(context.Background(), *bucketFlag, objectsCh, minio.RemoveObjectsOptions{})
 	for e := range errorCh {
 		s3backuplog.ErrorPrint("Failed to remove " + e.ObjectName + ", error: " + e.Err.Error())
+	}
+	if protectedByGrace > 0 {
+		s3backuplog.InfoPrint(
+			"%d unreferenced chunks kept, written less than %d hours ago (a backup may be running)",
+			protectedByGrace,
+			*chunkGraceHours,
+		)
 	}
 	// Do an integrity check to ensure that all referenced chunks exist
 	s3backuplog.InfoPrint("Running integrity check")
