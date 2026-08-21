@@ -61,11 +61,23 @@ likely to happen with hosted S3 over slow network connections.
 
 ## Sizes shown in PVE frontend
 
-The size column of the backup list shows the logical size of the snapshot, the
-size of the guest disks it contains, which is what an index states in its
-header. It is not the space the snapshot occupies in the bucket: chunks are
-shared between snapshots, so the sum of the snapshot sizes is much larger than
-the bucket itself.
+The size column of the backup list shows, by default, the logical size of the
+snapshot: the size of the guest disks it contains, which is what an index
+states in its header and what Proxmox Backup Server itself reports. It is not
+the space the snapshot occupies in the bucket, since chunks are shared between
+snapshots.
+
+`-snapshotsize` selects another figure:
+
+| Mode | Reports | Answers |
+|---|---|---|
+| `logical` (default) | size of the guest disks | what a restore produces |
+| `referenced` | size of the chunks it points at, shared ones included | what this backup would cost on its own |
+| `exclusive` | size of the chunks no other backup points at | what deleting it would actually free |
+
+`referenced` and `exclusive` come from the report written by the garbage
+collector, so they are at most one collector run old, and a snapshot taken
+since the last run falls back to its logical size rather than showing zero.
 
 The usage gauge of the storage shows the real size of the bucket. Free space
 cannot be derived from S3: a bucket has no capacity to read back. Pass
@@ -112,6 +124,8 @@ Usage of ./pmoxs3backuproxy:
         Server SSL key file (default "server.key")
   -lookuptype string
         Bucket lookup type: auto,dns,path (default: "auto")
+  -snapshotsize string
+        Size reported for a backup: logical (guest disk size), referenced (chunks it points at) or exclusive (chunks only it points at) (default "logical")
   -snapshotcachettl uint
         Seconds a snapshot listing is reused before listing the bucket again, 0 disables caching (default 30)
   -usagecachettl uint

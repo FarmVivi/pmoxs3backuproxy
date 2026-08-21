@@ -132,12 +132,12 @@ var bucketListCache *ttlCache[[]minio.BucketInfo]
 // changes the content of the datastore.
 var snapshotListCache *ttlCache[[]s3pmoxcommon.Snapshot]
 
+// snapshotSizeMode selects which figure is reported as the size of a backup.
+var snapshotSizeMode = SnapshotSizeLogical
+
 // usageStatsCache holds the deduplication report produced by the garbage
 // collector. It changes once a day at most.
 var usageStatsCache *ttlCache[[]byte]
-
-// usageStatsObject must match UsageStatsObject in the garbage collector.
-const usageStatsObject = "usage-stats.json"
 
 // datastoreCapacity is the announced size of the datastore in bytes. An S3
 // bucket usually has no quota to read back, so when it is left at zero the
@@ -232,6 +232,10 @@ func main() {
 		"datastoresize", 0,
 		"Capacity of the datastore in bytes, used to report free space, 0 if the bucket has no quota",
 	)
+	snapshotSizeFlag := flag.String(
+		"snapshotsize", string(SnapshotSizeLogical),
+		"Size reported for a backup: logical (guest disk size), referenced (chunks it points at) or exclusive (chunks only it points at)",
+	)
 	debug := flag.Bool("debug", false, "Debug logging")
 	flag.BoolVar(&printVersion, "version", false, "Show version and exit")
 	flag.BoolVar(&printVersion, "v", false, "Show version and exit")
@@ -257,6 +261,20 @@ func main() {
 	archiveSizeCache = newTTLCache[uint64](24 * time.Hour)
 	usageStatsCache = newTTLCache[[]byte](5 * time.Minute)
 	datastoreCapacity = *datastoreSizeFlag
+	if !ValidSnapshotSizeMode(*snapshotSizeFlag) {
+		s3backuplog.FatalPrint(
+			"Unknown -snapshotsize %q, expected logical, referenced or exclusive",
+			*snapshotSizeFlag,
+		)
+	}
+	snapshotSizeMode = SnapshotSizeMode(*snapshotSizeFlag)
+	if snapshotSizeMode != SnapshotSizeLogical {
+		s3backuplog.InfoPrint(
+			"Backups are reported with their %s size, which the garbage collector computes; "+
+				"snapshots missing from its last report fall back to their logical size",
+			snapshotSizeMode,
+		)
+	}
 
 	S := &Server{
 		S3Endpoint:     *endpointFlag,
@@ -305,6 +323,7 @@ func listSnapshotsCached(c *minio.Client, datastore string) ([]s3pmoxcommon.Snap
 			return nil, err
 		}
 		FillArchiveSizes(c, s)
+		ApplySnapshotSizeMode(snapshotSizeMode, s, readUsageStats(c, datastore))
 		return s, nil
 	})
 	return snapshots, err
@@ -326,6 +345,39 @@ func groupSize(size uint64) uint64 {
 func invalidateDataStoreCaches(datastore string) {
 	snapshotListCache.Invalidate(datastore)
 	datastoreUsageCache.Invalidate(datastore)
+}
+
+// readUsageStats returns the collector report of a datastore, or nil when
+// there is none yet. Callers must treat a nil report as "no footprint figures
+// available", never as an error: the report is a nicety, the listing it
+// decorates is not.
+func readUsageStats(c *minio.Client, datastore string) *s3pmoxcommon.UsageStats {
+	if snapshotSizeMode == SnapshotSizeLogical {
+		return nil
+	}
+	raw, _, err := usageStatsCache.Get(datastore, func() ([]byte, error) {
+		obj, err := c.GetObject(
+			context.Background(), datastore, s3pmoxcommon.UsageStatsObject, minio.GetObjectOptions{},
+		)
+		if err != nil {
+			return nil, err
+		}
+		defer obj.Close()
+		return io.ReadAll(obj)
+	})
+	if err != nil {
+		s3backuplog.WarnPrint(
+			"No usage report for [%s], backups keep their logical size until the garbage collector runs: %s",
+			datastore, err.Error(),
+		)
+		return nil
+	}
+	stats := &s3pmoxcommon.UsageStats{}
+	if err := json.Unmarshal(raw, stats); err != nil {
+		s3backuplog.WarnPrint("Unable to decode the usage report of [%s]: %s", datastore, err.Error())
+		return nil
+	}
+	return stats
 }
 
 func (s *Server) ticketGC() {
@@ -529,7 +581,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			 **/
 			stats, _, err := usageStatsCache.Get(ds, func() ([]byte, error) {
 				obj, err := C.Client.GetObject(
-					context.Background(), ds, usageStatsObject, minio.GetObjectOptions{},
+					context.Background(), ds, s3pmoxcommon.UsageStatsObject, minio.GetObjectOptions{},
 				)
 				if err != nil {
 					return nil, err
