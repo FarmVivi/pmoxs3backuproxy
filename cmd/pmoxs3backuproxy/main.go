@@ -132,6 +132,13 @@ var bucketListCache *ttlCache[[]minio.BucketInfo]
 // changes the content of the datastore.
 var snapshotListCache *ttlCache[[]s3pmoxcommon.Snapshot]
 
+// usageStatsCache holds the deduplication report produced by the garbage
+// collector. It changes once a day at most.
+var usageStatsCache *ttlCache[[]byte]
+
+// usageStatsObject must match UsageStatsObject in the garbage collector.
+const usageStatsObject = "usage-stats.json"
+
 // datastoreCapacity is the announced size of the datastore in bytes. An S3
 // bucket usually has no quota to read back, so when it is left at zero the
 // proxy reports a large free space rather than pretending the store is full.
@@ -248,6 +255,7 @@ func main() {
 	// An index under backups/ never changes, so its size is cached for as long
 	// as the process is expected to run between restarts.
 	archiveSizeCache = newTTLCache[uint64](24 * time.Hour)
+	usageStatsCache = newTTLCache[[]byte](5 * time.Minute)
 	datastoreCapacity = *datastoreSizeFlag
 
 	S := &Server{
@@ -507,6 +515,39 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte("Not implemented"))
 			return
 		}
+		if action == "s3stats" && r.Method == "GET" {
+			/**
+			 * Deduplication figures, as computed by the garbage collector
+			 * during its nightly mark and sweep and left in the bucket. They
+			 * cannot be produced on demand: knowing what a snapshot holds
+			 * exclusively means resolving every chunk reference of every
+			 * other snapshot. Reading them back is a single small GET.
+			 *
+			 * This endpoint is not part of the PBS API, PVE never calls it.
+			 * It exists so a human or a script can ask what a snapshot really
+			 * costs, which no column of the PVE interface can show.
+			 **/
+			stats, _, err := usageStatsCache.Get(ds, func() ([]byte, error) {
+				obj, err := C.Client.GetObject(
+					context.Background(), ds, usageStatsObject, minio.GetObjectOptions{},
+				)
+				if err != nil {
+					return nil, err
+				}
+				defer obj.Close()
+				return io.ReadAll(obj)
+			})
+			if err != nil {
+				w.WriteHeader(http.StatusNotFound)
+				io.WriteString(w, "no usage report yet, it is written by the garbage collector: "+err.Error())
+				return
+			}
+			w.Header().Add("Content-Type", "application/json")
+			resp, _ := json.Marshal(Response{Data: json.RawMessage(stats)})
+			w.Write(resp)
+			return
+		}
+
 		if action == "status" {
 			/**
 			 * The used space is the sum of the size of every object of the
