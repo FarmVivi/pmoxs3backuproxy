@@ -27,13 +27,7 @@ safety improvements. The main differences from upstream are:
   Dependabot updates, and narrowly scoped Renovate coverage for formats that
   Dependabot cannot parse.
 
-This fork has its own Semantic Versioning sequence. Its first consolidated
-release is `v0.1.0`; fixes increment the patch version (`v0.1.1`) and new
-backward-compatible features increment the minor version (`v0.2.0`) while the
-project remains below 1.0. The upstream version used as a base is documented
-separately and is not encoded as a pre-release suffix. Read release notes and
-validate both a backup and a restore before upgrading, especially when
-enabling the garbage collector or provider lifecycle policies.
+This fork follows Semantic Versioning, starting with `v0.1.0`.
 
 <!-- START doctoc generated TOC please keep comment here to allow auto update -->
 <!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
