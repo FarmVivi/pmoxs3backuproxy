@@ -44,6 +44,7 @@ func (s *Server) backup(sock net.Conn, C TicketEntry, ds string, S s3pmoxcommon.
 		Snapshot:          &S,
 		Writers:           make(map[int32]*Writer),
 		Finished:          false,
+		ChunkS3Timeout:    s.ChunkS3Timeout,
 	}
 	srv.ServeConn(sock, &http2.ServeConnOpts{Handler: snew})
 	if !snew.Finished { //Incomplete backup because connection died pve side, remove from S3

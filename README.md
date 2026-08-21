@@ -114,6 +114,8 @@ Usage of ./pmoxs3backuproxy:
         Seconds a datastore (bucket) listing is reused before asking the S3 endpoint again, 0 disables caching (default 60)
   -cert string
         Server SSL certificate file (default "server.crt")
+  -chunks3timeout uint
+        Maximum seconds for one chunk S3 operation, 0 disables the deadline (default 300)
   -datastoresize uint
         Capacity of the datastore in bytes, used to report free space, 0 if the bucket has no quota
   -debug
@@ -141,6 +143,13 @@ such as the used space are refreshed in the background rather than on the
 request path. Without that, a transient slowdown of the object store makes
 `vzdump` fail its pre-flight check with `error fetching datastores - 500 read
 timeout` and abort the whole backup job.
+
+Concurrent requests for the same content-addressed chunk are coalesced into a
+single S3 operation. Duplicate HTTP/2 request bodies are still drained while
+that operation is in progress, so they cannot consume the connection flow
+control window and block the upload. `-chunks3timeout` bounds the complete S3
+operation for one chunk; keep the default unless a 4 MiB chunk can legitimately
+take more than five minutes to upload.
 
 ```
 Usage of ./garbagecollector:
