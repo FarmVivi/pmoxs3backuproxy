@@ -1,4 +1,4 @@
 -j test
--P ubuntu-latest=-self-hosted
+-P ubuntu-24.04=-self-hosted
 --rm
 --no-cache-server

@@ -1,7 +1,42 @@
+> [!IMPORTANT]
+> This is a community fork of
+> [tizbac/pmoxs3backuproxy](https://github.com/tizbac/pmoxs3backuproxy).
+> Claude Code and OpenAI Codex were used to help analyse, implement, document,
+> and test changes in this fork. AI-assisted code can still contain mistakes:
+> review changes, test restores, and keep an independent backup before using it
+> in production. This notice does not add any warranty to the project licence.
+
+# About this fork
+
+This fork currently builds on upstream `v0.0.6` and adds operational and data
+safety work required by the Scipio deployment. The main differences from
+upstream are:
+
+- fail-closed garbage collection: complete index scanning, shared-chunk
+  protection, a grace period for in-flight uploads, safer locking, corruption
+  reporting, and usage statistics;
+- fixes and regression tests for concurrent chunk uploads, interrupted backup
+  sessions, cleanup paths, and chunk streaming during restore;
+- structured error, warning, information, and opt-in debug logs;
+- opt-in Proxmox UI reporting for datastore usage, archive sizes, encryption
+  state, and GC-derived referenced/exclusive sizes;
+- long-lived local caches with event-driven invalidation after completed,
+  failed, cancelled, deleted, or garbage-collected mutations;
+- separate S3 storage-class controls for chunks, backup metadata, and reusable
+  indexes;
+- reproducible dependency declarations, version-tagged CI tooling, daily
+  Dependabot updates, and narrowly scoped Renovate coverage for formats that
+  Dependabot cannot parse.
+
+The fork release suffix is `-scipioN`. Read release notes and validate both a
+backup and a restore before upgrading, especially when enabling the garbage
+collector or provider lifecycle policies.
+
 <!-- START doctoc generated TOC please keep comment here to allow auto update -->
 <!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
 **Table of Contents**
 
+- [About this fork](#about-this-fork)
 - [Working Features](#working-features)
 - [Known issues](#known-issues)
   - [S3 Restore Performance / Considerations](#s3-restore-performance--considerations)
