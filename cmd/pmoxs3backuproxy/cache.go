@@ -20,6 +20,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 package main
 
 import (
+	"strings"
 	"sync"
 	"time"
 	"tizbac/pmoxs3backuproxy/internal/s3backuplog"
@@ -60,6 +61,7 @@ type ttlCacheEntry[T any] struct {
 	fetched    time.Time
 	valid      bool
 	refreshing bool // a background refresh is in flight, see GetAsync
+	generation uint64
 }
 
 func newTTLCache[T any](ttl time.Duration) *ttlCache[T] {
@@ -136,6 +138,7 @@ func (c *ttlCache[T]) GetAsync(key string, fetch func() (T, error)) (T, bool) {
 	if !refreshing {
 		e.refreshing = true
 	}
+	generation := e.generation
 	e.mu.Unlock()
 
 	if !refreshing {
@@ -145,6 +148,11 @@ func (c *ttlCache[T]) GetAsync(key string, fetch func() (T, error)) (T, bool) {
 			e.mu.Lock()
 			defer e.mu.Unlock()
 			e.refreshing = false
+			if e.generation != generation {
+				// The upstream call started before a terminal mutation. Its
+				// result describes the old bucket state and must not resurrect it.
+				return
+			}
 			if err != nil {
 				s3backuplog.WarnPrint("Background refresh of cached entry [%s] failed: %s", key, err.Error())
 				return
@@ -168,6 +176,19 @@ func (c *ttlCache[T]) Peek(key string) (T, bool) {
 	return e.value, e.valid
 }
 
+// Store records a value already obtained as part of another mandatory
+// operation. Authentication validates credentials with ListBuckets; reusing
+// that response avoids paying for a second listing merely to warm this cache.
+func (c *ttlCache[T]) Store(key string, value T) {
+	e := c.entry(key)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.value = value
+	e.fetched = time.Now()
+	e.valid = true
+	e.generation++
+}
+
 // Invalidate drops the entry for key, so the next Get calls upstream again.
 // Used when the proxy itself mutated the underlying state and does not want to
 // wait out the TTL.
@@ -176,6 +197,24 @@ func (c *ttlCache[T]) Invalidate(key string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.valid = false
+	e.generation++
+}
+
+// InvalidatePrefix drops every entry whose key starts with prefix. Snapshot
+// manifests and indexes are keyed by datastore/object path; a terminal backup
+// event can therefore invalidate all derived metadata without knowing which
+// files the client managed to upload before it disconnected.
+func (c *ttlCache[T]) InvalidatePrefix(prefix string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for key, entry := range c.entries {
+		if strings.HasPrefix(key, prefix) {
+			entry.mu.Lock()
+			entry.valid = false
+			entry.generation++
+			entry.mu.Unlock()
+		}
+	}
 }
 
 // Expire forces a refresh while preserving the last known value. This is the
@@ -189,4 +228,5 @@ func (c *ttlCache[T]) Expire(key string) {
 	if e.valid {
 		e.fetched = time.Time{}
 	}
+	e.generation++
 }
