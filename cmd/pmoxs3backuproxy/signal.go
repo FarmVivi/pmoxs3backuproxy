@@ -18,8 +18,9 @@ func (s *Server) handleSignal() {
 			sig := <-sigs
 			switch sig {
 			case syscall.SIGINT, os.Interrupt, syscall.SIGTERM:
-				if s.Sessions > 0 && signalcnt < 1 {
-					s3backuplog.WarnPrint("%d sessions active skipping shutdown.", s.Sessions)
+				activeSessions := s.activeSessions()
+				if activeSessions > 0 && signalcnt < 1 {
+					s3backuplog.WarnPrint("%d sessions active skipping shutdown.", activeSessions)
 					s3backuplog.WarnPrint("Send signal again to force exit.")
 					signalcnt += 1
 					continue
@@ -34,10 +35,10 @@ func (s *Server) handleSignal() {
 				 * different matter, as it aborts backups in flight, and
 				 * keeps a failure status.
 				 **/
-				if s.Sessions > 0 {
+				if activeSessions > 0 {
 					s3backuplog.WarnPrint(
 						"Received signal %d, forced exit with %d sessions still active",
-						sig, s.Sessions,
+						sig, activeSessions,
 					)
 					os.Exit(1)
 				}

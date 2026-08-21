@@ -54,10 +54,15 @@ type Server struct {
 	TicketExpire      uint64
 	Sessions          uint64
 	SessionsMutex     sync.Mutex
-	SessionsRelease   mutex.Releaser
+	SessionLocks      map[string]*sessionLock
 	KnownChunksSizes  sync.Map
 	LookupTypeFlag    string
 	ChunkS3Timeout    time.Duration
+}
+
+type sessionLock struct {
+	count    uint64
+	releaser mutex.Releaser
 }
 
 type DataStoreStatus struct {

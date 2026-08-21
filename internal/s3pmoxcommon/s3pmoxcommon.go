@@ -2,7 +2,10 @@ package s3pmoxcommon
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -13,81 +16,100 @@ import (
 	"github.com/minio/minio-go/v7"
 )
 
+// DataStoreLockName is shared by the proxy and collector. Both processes must
+// also use a common TMPDIR because juju/mutex stores this named lock there.
+func DataStoreLockName(endpoint string, datastore string) string {
+	h := sha256.Sum256([]byte(endpoint + "|" + datastore))
+	return "PBSS3" + hex.EncodeToString(h[:])[:16]
+}
+
 func ListSnapshots(c minio.Client, datastore string, returnCorrupted bool) ([]Snapshot, error) {
-	resparray := make([]Snapshot, 0)
-	resparray2 := make([]Snapshot, 0)
-	prefixMap := make(map[string]*Snapshot)
 	ctx := context.Background()
+	objects := make([]minio.ObjectInfo, 0)
 	for object := range c.ListObjects(
 		ctx, datastore,
 		minio.ListObjectsOptions{Recursive: true, Prefix: "backups/",
 			WithMetadata: true,
 		}) {
-		//The object name is backupid|unixtimestamp|type
-		path := strings.Split(object.Key, "/")
-		if strings.Count(object.Key, "/") == 2 {
-			fields := strings.Split(path[1], "|")
-			existing_S, ok := prefixMap[path[1]]
-			if ok {
-				if len(path) == 3 {
-					/** Dont add the custom chunk index list
-					 * for dynamic backup to filelist
-					 **/
-					if strings.HasSuffix(path[2], ".csjson") {
-						continue
-					}
-					if object.UserTags["protected"] == "true" {
-						existing_S.Protected = true
-					}
-					if object.UserTags["note"] != "" {
-						note, _ := base64.RawStdEncoding.DecodeString(object.UserTags["note"])
-						existing_S.Comment = string(note)
-					}
-					existing_S.Files = append(existing_S.Files, SnapshotFile{
-						Filename:  path[2],
-						CryptMode: "none", //TODO
-						Size:      uint64(object.Size),
-					})
-				}
-				continue
-			}
+		if object.Err != nil {
+			return nil, fmt.Errorf("list snapshots in %s: %w", datastore, object.Err)
+		}
+		objects = append(objects, object)
+	}
+	return SnapshotsFromObjects(objects, datastore, returnCorrupted)
+}
 
-			backupid := fields[0]
-			backuptime := fields[1]
-			backuptype := fields[2]
-			backuptimei, _ := strconv.ParseUint(backuptime, 10, 64)
-			S := Snapshot{
-				BackupID:   backupid,
-				BackupTime: backuptimei,
-				BackupType: backuptype,
+// SnapshotsFromObjects builds snapshots from a complete backups/ listing.
+// Callers must never pass a partial listing: garbage collection decisions rely
+// on every index being visible.
+func SnapshotsFromObjects(objects []minio.ObjectInfo, datastore string, returnCorrupted bool) ([]Snapshot, error) {
+	byPrefix := make(map[string]*Snapshot)
+	order := make([]string, 0)
+	for _, object := range objects {
+		if object.Err != nil {
+			return nil, fmt.Errorf("snapshot listing contains an error: %w", object.Err)
+		}
+		if !strings.HasPrefix(object.Key, "backups/") {
+			continue
+		}
+		rest := strings.TrimPrefix(object.Key, "backups/")
+		parts := strings.SplitN(rest, "/", 2)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			return nil, fmt.Errorf("invalid snapshot object key %q", object.Key)
+		}
+		fields := strings.Split(parts[0], "|")
+		if len(fields) != 3 || fields[0] == "" || fields[2] == "" {
+			return nil, fmt.Errorf("invalid snapshot prefix %q", parts[0])
+		}
+		backupTime, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid snapshot timestamp in %q: %w", parts[0], err)
+		}
+
+		snapshot, ok := byPrefix[parts[0]]
+		if !ok {
+			snapshot = &Snapshot{
+				BackupID:   fields[0],
+				BackupTime: backupTime,
+				BackupType: fields[2],
 				Files:      make([]SnapshotFile, 0),
 				Datastore:  datastore,
-				corrupted:  false,
 			}
-
-			if len(path) == 3 {
-				S.Files = append(S.Files, SnapshotFile{
-					Filename:  path[2],
-					CryptMode: "none", //TODO
-					Size:      uint64(object.Size),
-				})
-			}
-
-			resparray = append(resparray, S)
-			prefixMap[path[1]] = &resparray[len(resparray)-1]
-
+			byPrefix[parts[0]] = snapshot
+			order = append(order, parts[0])
 		}
-
-		if strings.HasSuffix(object.Key, "/corrupted") {
-			prefixMap[path[1]].corrupted = true
+		if parts[1] == "corrupted" {
+			snapshot.corrupted = true
+		}
+		if object.UserTags["protected"] == "true" {
+			snapshot.Protected = true
+		}
+		if encodedNote := object.UserTags["note"]; encodedNote != "" {
+			note, err := base64.RawStdEncoding.DecodeString(encodedNote)
+			// Notes are cosmetic metadata and older S3 implementations may expose
+			// a malformed value. Preserve the historical behaviour: a bad note
+			// must not hide an otherwise valid backup or block the GC mark phase.
+			if err == nil {
+				snapshot.Comment = string(note)
+			}
+		}
+		if !strings.HasSuffix(parts[1], ".csjson") {
+			snapshot.Files = append(snapshot.Files, SnapshotFile{
+				Filename:  parts[1],
+				CryptMode: "none", // TODO: expose the actual encryption mode.
+				Size:      uint64(object.Size),
+			})
 		}
 	}
-	for _, s := range resparray {
-		if returnCorrupted || !s.corrupted {
-			resparray2 = append(resparray2, s)
+
+	result := make([]Snapshot, 0, len(order))
+	for _, prefix := range order {
+		snapshot := byPrefix[prefix]
+		if returnCorrupted || !snapshot.corrupted {
+			result = append(result, *snapshot)
 		}
 	}
-	return resparray2, ctx.Err()
+	return result, nil
 }
 
 func GetLatestSnapshot(c minio.Client, ds string, id string, time uint64) (*Snapshot, error) {
@@ -164,24 +186,32 @@ func (S *Snapshot) ReadTags(c minio.Client) (map[string]string, error) {
 }
 
 func (S *Snapshot) Delete(c minio.Client) error {
+	ctx := context.Background()
+	objects := make([]minio.ObjectInfo, 0)
+	// The trailing slash makes the boundary explicit. Without it, an unusual
+	// backup type whose name starts with another type could share the prefix.
+	prefix := S.S3Prefix() + "/"
+	for object := range c.ListObjects(ctx, S.Datastore, minio.ListObjectsOptions{Prefix: prefix, Recursive: true}) {
+		if object.Err != nil {
+			return fmt.Errorf("list snapshot %s before deletion: %w", S.S3Prefix(), object.Err)
+		}
+		objects = append(objects, object)
+	}
+
 	objectsCh := make(chan minio.ObjectInfo)
 	go func() {
 		defer close(objectsCh)
-		// List all objects from a bucket-name with a matching prefix.
-		opts := minio.ListObjectsOptions{Prefix: S.S3Prefix(), Recursive: true}
-		for object := range c.ListObjects(context.Background(), S.Datastore, opts) {
-			if object.Err != nil {
-				s3backuplog.ErrorPrint(object.Err.Error())
-			}
+		for _, object := range objects {
 			objectsCh <- object
 		}
 	}()
-	errorCh := c.RemoveObjects(context.Background(), S.Datastore, objectsCh, minio.RemoveObjectsOptions{})
+	errorCh := c.RemoveObjects(ctx, S.Datastore, objectsCh, minio.RemoveObjectsOptions{})
+	var deleteErrors []error
 	for e := range errorCh {
 		s3backuplog.ErrorPrint("Failed to remove " + e.ObjectName + ", error: " + e.Err.Error())
-		return e.Err
+		deleteErrors = append(deleteErrors, fmt.Errorf("remove %s: %w", e.ObjectName, e.Err))
 	}
-	return nil
+	return errors.Join(deleteErrors...)
 }
 
 func GetLookupType(Typeflag string) minio.BucketLookupType {
