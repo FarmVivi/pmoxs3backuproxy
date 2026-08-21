@@ -8,44 +8,10 @@ import (
 	"strings"
 	"time"
 	"tizbac/pmoxs3backuproxy/internal/s3backuplog"
+	"tizbac/pmoxs3backuproxy/internal/s3pmoxcommon"
 
 	"github.com/minio/minio-go/v7"
 )
-
-// UsageStatsObject is where the report is written inside the bucket. The proxy
-// serves it as is, so a size that took a full mark and sweep to compute costs
-// a single small GET to read back.
-const UsageStatsObject = "usage-stats.json"
-
-// SnapshotUsage describes what one snapshot represents and what it actually
-// costs.
-//
-// The three figures answer three different questions, and confusing them is
-// the usual way to misread a deduplicating store:
-//
-//   - Logical is the size of the guest disks or streams it contains. It is
-//     what the backup restores, and the sum over all snapshots is far larger
-//     than the bucket, which is precisely the point of deduplication.
-//   - Referenced is the size of the chunks it points at, counting a shared
-//     chunk in full. It is what the snapshot would cost on its own.
-//   - Exclusive is the size of the chunks no other snapshot points at, which
-//     is what deleting this snapshot actually frees.
-type SnapshotUsage struct {
-	Snapshot        string `json:"snapshot"`
-	LogicalBytes    uint64 `json:"logical-bytes"`
-	ReferencedBytes uint64 `json:"referenced-bytes"`
-	ExclusiveBytes  uint64 `json:"exclusive-bytes"`
-	Chunks          uint64 `json:"chunks"`
-}
-
-// UsageStats is the whole report.
-type UsageStats struct {
-	Generated    int64           `json:"generated"`
-	ChunkBytes   uint64          `json:"chunk-bytes"`
-	Chunks       uint64          `json:"chunks"`
-	LogicalBytes uint64          `json:"logical-bytes"`
-	Snapshots    []SnapshotUsage `json:"snapshots"`
-}
 
 // snapshotOfIndex maps backups/<id>|<time>|<type>/<archive> to its snapshot.
 func snapshotOfIndex(indexKey string) string {
@@ -65,12 +31,12 @@ func computeUsageStats(
 	knownChunks map[string][]string,
 	chunkSizes map[string]uint64,
 	archiveSizes map[string]uint64,
-) UsageStats {
-	perSnapshot := make(map[string]*SnapshotUsage)
-	get := func(name string) *SnapshotUsage {
+) s3pmoxcommon.UsageStats {
+	perSnapshot := make(map[string]*s3pmoxcommon.SnapshotUsage)
+	get := func(name string) *s3pmoxcommon.SnapshotUsage {
 		u, ok := perSnapshot[name]
 		if !ok {
-			u = &SnapshotUsage{Snapshot: name}
+			u = &s3pmoxcommon.SnapshotUsage{Snapshot: name}
 			perSnapshot[name] = u
 		}
 		return u
@@ -80,7 +46,7 @@ func computeUsageStats(
 		get(snapshotOfIndex(indexKey)).LogicalBytes += size
 	}
 
-	stats := UsageStats{Generated: time.Now().Unix()}
+	stats := s3pmoxcommon.UsageStats{Generated: time.Now().Unix()}
 
 	for digest, indexes := range knownChunks {
 		size := chunkSizes[digest]
@@ -101,7 +67,7 @@ func computeUsageStats(
 		}
 	}
 
-	stats.Snapshots = make([]SnapshotUsage, 0, len(perSnapshot))
+	stats.Snapshots = make([]s3pmoxcommon.SnapshotUsage, 0, len(perSnapshot))
 	for _, u := range perSnapshot {
 		stats.LogicalBytes += u.LogicalBytes
 		stats.Snapshots = append(stats.Snapshots, *u)
@@ -146,7 +112,7 @@ func writeUsageStats(
 		return
 	}
 	_, err = c.PutObject(
-		ctx, bucket, UsageStatsObject,
+		ctx, bucket, s3pmoxcommon.UsageStatsObject,
 		bytes.NewReader(payload), int64(len(payload)),
 		minio.PutObjectOptions{ContentType: "application/json"},
 	)
@@ -154,5 +120,5 @@ func writeUsageStats(
 		s3backuplog.WarnPrint("Unable to store the usage report: %s", err.Error())
 		return
 	}
-	s3backuplog.InfoPrint("Usage report written to %s", UsageStatsObject)
+	s3backuplog.InfoPrint("Usage report written to %s", s3pmoxcommon.UsageStatsObject)
 }

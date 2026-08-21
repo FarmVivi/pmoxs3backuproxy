@@ -132,6 +132,77 @@ func FillArchiveSizes(c *minio.Client, snapshots []s3pmoxcommon.Snapshot) {
 	}
 }
 
+// SnapshotSizeMode selects which figure the snapshot listing reports as the
+// size of a backup, which is what PVE shows in the size column.
+//
+// There is no single honest answer on a deduplicating store, so the choice is
+// left to the operator:
+//
+//   - "logical" is the size of the guest disks the backup contains. It is what
+//     Proxmox Backup Server itself reports, it is always available, and it is
+//     the only figure that does not depend on the other snapshots. It says
+//     nothing about the space used in the bucket.
+//   - "referenced" is the size of the chunks the backup points at, counting
+//     shared chunks in full: what this backup would cost if it were alone.
+//   - "exclusive" is the size of the chunks no other backup points at: what
+//     deleting this backup would actually free. Summed over a datastore it
+//     approaches the size of the bucket, which makes it the closest answer to
+//     "how much does this backup cost me".
+//
+// The last two are only known from the report the garbage collector writes, so
+// they are at most one collector run old, and a snapshot taken since the last
+// run has no entry. Both cases fall back to the logical size rather than
+// showing zero.
+type SnapshotSizeMode string
+
+const (
+	SnapshotSizeLogical    SnapshotSizeMode = "logical"
+	SnapshotSizeReferenced SnapshotSizeMode = "referenced"
+	SnapshotSizeExclusive  SnapshotSizeMode = "exclusive"
+)
+
+// ValidSnapshotSizeMode reports whether a mode name is one we implement.
+func ValidSnapshotSizeMode(mode string) bool {
+	switch SnapshotSizeMode(mode) {
+	case SnapshotSizeLogical, SnapshotSizeReferenced, SnapshotSizeExclusive:
+		return true
+	}
+	return false
+}
+
+// ApplySnapshotSizeMode replaces the logical sizes already filled in by
+// FillArchiveSizes with the figures from the collector report, for the modes
+// that need it. Snapshots missing from the report keep their logical size.
+func ApplySnapshotSizeMode(
+	mode SnapshotSizeMode,
+	snapshots []s3pmoxcommon.Snapshot,
+	stats *s3pmoxcommon.UsageStats,
+) {
+	if mode == SnapshotSizeLogical || stats == nil {
+		return
+	}
+
+	byPrefix := make(map[string]s3pmoxcommon.SnapshotUsage, len(stats.Snapshots))
+	for _, s := range stats.Snapshots {
+		byPrefix[s.Snapshot] = s
+	}
+
+	for i := range snapshots {
+		u, ok := byPrefix[snapshots[i].S3Prefix()]
+		if !ok {
+			// Taken since the last collector run: nothing to say about its
+			// footprint yet, the logical size stands.
+			continue
+		}
+		switch mode {
+		case SnapshotSizeReferenced:
+			snapshots[i].Size = u.ReferencedBytes
+		case SnapshotSizeExclusive:
+			snapshots[i].Size = u.ExclusiveBytes
+		}
+	}
+}
+
 // ComputeDataStoreUsage reports what a datastore holds.
 //
 // Some S3 implementations already know the answer and state it in the headers

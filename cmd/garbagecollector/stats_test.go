@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"tizbac/pmoxs3backuproxy/internal/s3pmoxcommon"
+)
 
 // Two snapshots of the same guest: they share most of their chunks, each has
 // one of its own. This is the shape the report has to get right, because it is
@@ -37,7 +41,7 @@ func TestComputeUsageStatsSharedAndExclusiveChunks(t *testing.T) {
 		t.Fatalf("got %d snapshots, want 2", len(stats.Snapshots))
 	}
 
-	byName := map[string]SnapshotUsage{}
+	byName := map[string]s3pmoxcommon.SnapshotUsage{}
 	for _, s := range stats.Snapshots {
 		byName[s.Snapshot] = s
 	}
