@@ -215,6 +215,18 @@ func main() {
 		"chunks3timeout", 300,
 		"Maximum seconds for one chunk S3 operation, 0 disables the deadline",
 	)
+	chunkStorageClassFlag := flag.String(
+		"chunkstorageclass", "",
+		"S3 storage class for newly uploaded chunks; empty uses the provider default",
+	)
+	backupStorageClassFlag := flag.String(
+		"backupstorageclass", "",
+		"S3 storage class for newly uploaded backup indexes, manifests, configs and logs; empty uses the provider default",
+	)
+	indexedStorageClassFlag := flag.String(
+		"indexedstorageclass", "",
+		"S3 storage class for newly created reusable index copies; empty uses the provider default",
+	)
 	flag.BoolVar(&printVersion, "version", false, "Show version and exit")
 	flag.BoolVar(&printVersion, "v", false, "Show version and exit")
 	flag.Parse()
@@ -269,6 +281,19 @@ func main() {
 		TicketExpire:   *ticketExpireFlag,
 		LookupTypeFlag: *lookupTypeFlag,
 		ChunkS3Timeout: time.Duration(*chunkS3TimeoutFlag) * time.Second,
+		StorageClasses: storageClassPolicy{
+			Chunks:  strings.TrimSpace(*chunkStorageClassFlag),
+			Backups: strings.TrimSpace(*backupStorageClassFlag),
+			Indexed: strings.TrimSpace(*indexedStorageClassFlag),
+		},
+	}
+	if S.StorageClasses != (storageClassPolicy{}) {
+		s3backuplog.InfoPrint(
+			"S3 storage classes for new objects: chunks=%q backups=%q indexed=%q (empty means provider default)",
+			S.StorageClasses.Chunks,
+			S.StorageClasses.Backups,
+			S.StorageClasses.Indexed,
+		)
 	}
 	srv := &http.Server{Addr: *bindAddress, Handler: S}
 	srv.SetKeepAlivesEnabled(true)
@@ -756,7 +781,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				tgtfile,
 				r.Body,
 				r.ContentLength,
-				minio.PutObjectOptions{},
+				putOptions(s.StorageClasses.Backups, nil),
 			)
 			if err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
@@ -1063,9 +1088,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			s.Snapshot.S3Prefix()+"/"+s.Writers[int32(wid)].FidxName,
 			R,
 			int64(len(outFile)),
-			minio.PutObjectOptions{
-				UserMetadata: map[string]string{"csum": r.URL.Query().Get("csum")},
-			},
+			putOptions(
+				s.StorageClasses.Backups,
+				map[string]string{"csum": r.URL.Query().Get("csum")},
+			),
 		)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -1077,10 +1103,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		//It will waste a bit of space, but indexes overall are much smaller than actual data , so for now is a price that can be paid to avoid going thru all the files
 		_, err = s.H2Ticket.Client.CopyObject(
 			context.Background(),
-			minio.CopyDestOptions{
-				Bucket: *s.SelectedDataStore,
-				Object: "indexed/" + r.URL.Query().Get("csum") + ".fidx",
-			},
+			indexedCopyOptions(
+				*s.SelectedDataStore,
+				"indexed/"+r.URL.Query().Get("csum")+".fidx",
+				r.URL.Query().Get("csum"),
+				s.StorageClasses.Indexed,
+			),
 			minio.CopySrcOptions{
 				Bucket: *s.SelectedDataStore,
 				Object: s.Snapshot.S3Prefix() + "/" + s.Writers[int32(wid)].FidxName,
@@ -1151,9 +1179,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			s.Snapshot.S3Prefix()+"/"+s.Writers[int32(wid)].FidxName,
 			R,
 			int64(R.Len()),
-			minio.PutObjectOptions{
-				UserMetadata: map[string]string{"csum": r.URL.Query().Get("csum")},
-			},
+			putOptions(
+				s.StorageClasses.Backups,
+				map[string]string{"csum": r.URL.Query().Get("csum")},
+			),
 		)
 
 		if err != nil {
@@ -1172,9 +1201,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			s.Snapshot.S3Prefix()+"/"+s.Writers[int32(wid)].FidxName+".csjson",
 			R,
 			int64(R.Len()),
-			minio.PutObjectOptions{
-				UserMetadata: map[string]string{"csum": r.URL.Query().Get("csum")},
-			},
+			putOptions(
+				s.StorageClasses.Backups,
+				map[string]string{"csum": r.URL.Query().Get("csum")},
+			),
 		)
 
 		if err != nil {
@@ -1298,7 +1328,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ctx,
 			*s.SelectedDataStore+"/"+request.ObjectName,
 			func() (bool, error) {
-				known, err := storeChunk(ctx, s.H2Ticket.Client, *s.SelectedDataStore, request, r.Body)
+				known, err := storeChunk(
+					ctx,
+					s.H2Ticket.Client,
+					*s.SelectedDataStore,
+					request,
+					r.Body,
+					s.StorageClasses.Chunks,
+				)
 				s3backuplog.DebugPrint(
 					"chunk leader finished datastore=%s digest=%s known=%t duration=%s err=%v",
 					*s.SelectedDataStore,
@@ -1383,7 +1420,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, err := s.H2Ticket.Client.PutObject(
 			context.Background(),
 			*s.SelectedDataStore,
-			s.Snapshot.S3Prefix()+"/"+blobname, r.Body, int64(esize), minio.PutObjectOptions{},
+			s.Snapshot.S3Prefix()+"/"+blobname,
+			r.Body,
+			int64(esize),
+			putOptions(s.StorageClasses.Backups, nil),
 		)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)

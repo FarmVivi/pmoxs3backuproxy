@@ -107,6 +107,7 @@ type fakeChunkStore struct {
 	putErr   error
 	puts     int
 	putBytes []byte
+	putOpts  minio.PutObjectOptions
 	putStart chan struct{}
 	putWait  chan struct{}
 }
@@ -163,7 +164,7 @@ func (s *fakeChunkStore) PutObject(
 	_ string,
 	r io.Reader,
 	size int64,
-	_ minio.PutObjectOptions,
+	opts minio.PutObjectOptions,
 ) (minio.UploadInfo, error) {
 	if s.putStart != nil {
 		close(s.putStart)
@@ -178,6 +179,7 @@ func (s *fakeChunkStore) PutObject(
 	s.mu.Lock()
 	s.puts++
 	s.putBytes = append([]byte(nil), b...)
+	s.putOpts = opts
 	putErr := s.putErr
 	if putErr == nil {
 		s.exists = true
@@ -199,19 +201,22 @@ func requestForBody(size int) chunkRequest {
 func TestStoreChunkUploadsMissingObject(t *testing.T) {
 	store := &fakeChunkStore{}
 	body := []byte("new chunk")
-	known, err := storeChunk(context.Background(), store, "bucket", requestForBody(len(body)), bytes.NewReader(body))
+	known, err := storeChunk(context.Background(), store, "bucket", requestForBody(len(body)), bytes.NewReader(body), "STANDARD_IA")
 	if err != nil || known {
 		t.Fatalf("got known=%v err=%v, want new chunk success", known, err)
 	}
 	if store.puts != 1 || !bytes.Equal(store.putBytes, body) {
 		t.Fatalf("put state: count=%d body=%q", store.puts, store.putBytes)
 	}
+	if store.putOpts.StorageClass != "STANDARD_IA" {
+		t.Fatalf("storage class %q, want STANDARD_IA", store.putOpts.StorageClass)
+	}
 }
 
 func TestStoreChunkDrainsKnownObjectWithoutPut(t *testing.T) {
 	store := &fakeChunkStore{exists: true}
 	body := []byte("known chunk")
-	known, err := storeChunk(context.Background(), store, "bucket", requestForBody(len(body)), bytes.NewReader(body))
+	known, err := storeChunk(context.Background(), store, "bucket", requestForBody(len(body)), bytes.NewReader(body), "STANDARD_IA")
 	if err != nil || !known {
 		t.Fatalf("got known=%v err=%v, want known chunk success", known, err)
 	}
@@ -223,7 +228,7 @@ func TestStoreChunkDrainsKnownObjectWithoutPut(t *testing.T) {
 func TestStoreChunkPropagatesEveryFailure(t *testing.T) {
 	t.Run("unexpected stat error", func(t *testing.T) {
 		store := &fakeChunkStore{statErr: minio.ErrorResponse{Code: "AccessDenied", StatusCode: http.StatusForbidden}}
-		if _, err := storeChunk(context.Background(), store, "bucket", requestForBody(1), strings.NewReader("x")); err == nil || !strings.Contains(err.Error(), "stat chunk") {
+		if _, err := storeChunk(context.Background(), store, "bucket", requestForBody(1), strings.NewReader("x"), ""); err == nil || !strings.Contains(err.Error(), "stat chunk") {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if store.puts != 0 {
@@ -232,25 +237,25 @@ func TestStoreChunkPropagatesEveryFailure(t *testing.T) {
 	})
 	t.Run("put error", func(t *testing.T) {
 		store := &fakeChunkStore{putErr: errors.New("put failed")}
-		if _, err := storeChunk(context.Background(), store, "bucket", requestForBody(1), strings.NewReader("x")); err == nil || !strings.Contains(err.Error(), "put chunk") {
+		if _, err := storeChunk(context.Background(), store, "bucket", requestForBody(1), strings.NewReader("x"), ""); err == nil || !strings.Contains(err.Error(), "put chunk") {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
 	t.Run("short uploaded body", func(t *testing.T) {
 		store := &fakeChunkStore{}
-		if _, err := storeChunk(context.Background(), store, "bucket", requestForBody(2), strings.NewReader("x")); err == nil || !strings.Contains(err.Error(), "consumed 1") {
+		if _, err := storeChunk(context.Background(), store, "bucket", requestForBody(2), strings.NewReader("x"), ""); err == nil || !strings.Contains(err.Error(), "consumed 1") {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
 	t.Run("trailing uploaded body", func(t *testing.T) {
 		store := &fakeChunkStore{}
-		if _, err := storeChunk(context.Background(), store, "bucket", requestForBody(1), strings.NewReader("xy")); err == nil || !strings.Contains(err.Error(), "trailing encoded bytes") {
+		if _, err := storeChunk(context.Background(), store, "bucket", requestForBody(1), strings.NewReader("xy"), ""); err == nil || !strings.Contains(err.Error(), "trailing encoded bytes") {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
 	t.Run("known body read error", func(t *testing.T) {
 		store := &fakeChunkStore{exists: true}
-		if _, err := storeChunk(context.Background(), store, "bucket", requestForBody(1), errorReader{}); err == nil || !strings.Contains(err.Error(), "drain known") {
+		if _, err := storeChunk(context.Background(), store, "bucket", requestForBody(1), errorReader{}, ""); err == nil || !strings.Contains(err.Error(), "drain known") {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
@@ -267,7 +272,7 @@ func TestStoreChunkHonorsContextCancellation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 			defer cancel()
-			_, err := storeChunk(ctx, tt.store, "bucket", requestForBody(1), strings.NewReader("x"))
+			_, err := storeChunk(ctx, tt.store, "bucket", requestForBody(1), strings.NewReader("x"), "")
 			if !errors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("got %v, want context deadline", err)
 			}

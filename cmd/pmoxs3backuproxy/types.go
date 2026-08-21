@@ -58,6 +58,7 @@ type Server struct {
 	KnownChunksSizes  sync.Map
 	LookupTypeFlag    string
 	ChunkS3Timeout    time.Duration
+	StorageClasses    storageClassPolicy
 }
 
 type sessionLock struct {

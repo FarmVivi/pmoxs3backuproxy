@@ -116,8 +116,12 @@ Usage of ./pmoxs3backuproxy:
 
   -cacheinvalidatedir string
         Shared local directory for proxy/collector cache invalidation tokens; empty disables cross-process invalidation
+  -backupstorageclass string
+        S3 storage class for newly uploaded backup indexes, manifests, configs and logs; empty uses the provider default
   -cert string
         Server SSL certificate file (default "server.crt")
+  -chunkstorageclass string
+        S3 storage class for newly uploaded chunks; empty uses the provider default
   -chunks3timeout uint
         Maximum seconds for one chunk S3 operation, 0 disables the deadline (default 300)
   -datastoresize uint
@@ -130,6 +134,8 @@ Usage of ./pmoxs3backuproxy:
         Seconds a garbage-collector usage report is cached after an opt-in read (default 3600)
   -key string
         Server SSL key file (default "server.key")
+  -indexedstorageclass string
+        S3 storage class for newly created reusable index copies; empty uses the provider default
   -lookuptype string
         Bucket lookup type: auto,dns,path (default: "auto")
   -metadatacachettl uint
@@ -171,6 +177,22 @@ snapshot deletion, notes/protection changes, and garbage collection. Pass the
 same writable `-cacheinvalidatedir` to the proxy and collector to propagate GC
 changes without polling S3. Changes made by an unrelated external S3 client
 cannot be observed event-by-event and remain bounded by the TTL.
+
+Storage classes are opt-in and apply only when a new object is created. Use
+`-chunkstorageclass` for the large content-addressed data under `chunks/`,
+`-backupstorageclass` for snapshot metadata under `backups/`, and
+`-indexedstorageclass` for reusable fixed-index copies under `indexed/`.
+Leaving an option empty preserves the provider's default class. Existing
+objects are never rewritten implicitly; migrate them with a carefully scoped
+provider lifecycle rule or an explicit S3 copy operation.
+
+For backup workloads, keeping `backups/` and `indexed/` in a hot class is the
+safe default because restore, listing and garbage collection read them.
+Infrequent-access classes are normally appropriate only for `chunks/`, and
+only when their minimum storage duration and retrieval fees fit the retention
+policy. Never configure an independent lifecycle expiration for `chunks/`:
+chunks are shared across snapshots and must only be deleted by the garbage
+collector after it has scanned every retained index.
 
 Concurrent requests for the same content-addressed chunk are coalesced into a
 single S3 operation. Duplicate HTTP/2 request bodies are still drained while
