@@ -126,6 +126,22 @@ var chunkUploadMutex keyedMutex
 // TTL plus serve-stale-on-error removes that failure mode entirely.
 var bucketListCache *ttlCache[[]minio.BucketInfo]
 
+// snapshotListCache holds the snapshot listing of a datastore. Listing it
+// means walking every object under backups/, which the web UI would otherwise
+// trigger on every refresh. It is invalidated as soon as the proxy itself
+// changes the content of the datastore.
+var snapshotListCache *ttlCache[[]s3pmoxcommon.Snapshot]
+
+// datastoreCapacity is the announced size of the datastore in bytes. An S3
+// bucket usually has no quota to read back, so when it is left at zero the
+// proxy reports a large free space rather than pretending the store is full.
+var datastoreCapacity uint64
+
+// unknownDataStoreCapacity is the free space reported when no capacity was
+// configured. Reporting zero free space would make the PVE gauge show a full
+// storage, which is both wrong and alarming for a store that has no quota.
+const unknownDataStoreCapacity = uint64(1) << 50 // 1 PiB
+
 const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 var (
@@ -197,6 +213,18 @@ func main() {
 		"bucketcachettl", 60,
 		"Seconds a datastore (bucket) listing is reused before asking the S3 endpoint again, 0 disables caching",
 	)
+	snapshotCacheTTLFlag := flag.Uint64(
+		"snapshotcachettl", 30,
+		"Seconds a snapshot listing is reused before listing the bucket again, 0 disables caching",
+	)
+	usageCacheTTLFlag := flag.Uint64(
+		"usagecachettl", 900,
+		"Seconds before the used space of a datastore is recomputed in the background",
+	)
+	datastoreSizeFlag := flag.Uint64(
+		"datastoresize", 0,
+		"Capacity of the datastore in bytes, used to report free space, 0 if the bucket has no quota",
+	)
 	debug := flag.Bool("debug", false, "Debug logging")
 	flag.BoolVar(&printVersion, "version", false, "Show version and exit")
 	flag.BoolVar(&printVersion, "v", false, "Show version and exit")
@@ -215,6 +243,12 @@ func main() {
 	}
 
 	bucketListCache = newTTLCache[[]minio.BucketInfo](time.Duration(*bucketCacheTTLFlag) * time.Second)
+	snapshotListCache = newTTLCache[[]s3pmoxcommon.Snapshot](time.Duration(*snapshotCacheTTLFlag) * time.Second)
+	datastoreUsageCache = newTTLCache[DataStoreUsage](time.Duration(*usageCacheTTLFlag) * time.Second)
+	// An index under backups/ never changes, so its size is cached for as long
+	// as the process is expected to run between restarts.
+	archiveSizeCache = newTTLCache[uint64](24 * time.Hour)
+	datastoreCapacity = *datastoreSizeFlag
 
 	S := &Server{
 		S3Endpoint:     *endpointFlag,
@@ -248,6 +282,42 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+}
+
+// listSnapshotsCached returns the snapshots of a datastore, going to the object
+// store at most once per TTL. Sizes are resolved before the value is cached so
+// that every reader gets them for free.
+//
+// The incremental backup path deliberately does not go through this cache:
+// GetLatestSnapshot must always observe the real state of the bucket.
+func listSnapshotsCached(c *minio.Client, datastore string) ([]s3pmoxcommon.Snapshot, error) {
+	snapshots, _, err := snapshotListCache.Get(datastore, func() ([]s3pmoxcommon.Snapshot, error) {
+		s, err := s3pmoxcommon.ListSnapshots(*c, datastore, false)
+		if err != nil {
+			return nil, err
+		}
+		FillArchiveSizes(c, s)
+		return s, nil
+	})
+	return snapshots, err
+}
+
+// groupSize keeps the historical placeholder when the real size is unknown, as
+// a size of zero makes proxmox-backup-manager treat the group as an unfinished
+// backup and skip it during a sync.
+func groupSize(size uint64) uint64 {
+	if size == 0 {
+		return 200
+	}
+	return size
+}
+
+// invalidateDataStoreCaches drops what the proxy knows about a datastore whose
+// content it just changed, so the next request reflects the change instead of
+// waiting out a TTL.
+func invalidateDataStoreCaches(datastore string) {
+	snapshotListCache.Invalidate(datastore)
+	datastoreUsageCache.Invalidate(datastore)
 }
 
 func (s *Server) ticketGC() {
@@ -438,16 +508,45 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if action == "status" {
-			//Seems to not be supported by minio fetching used size so we return dummy values to make all look fine
-			resp, _ := json.Marshal(Response{
-				Data: DataStoreStatus{
-					Used:    10000,
-					Avail:   10000000,
-					Total:   10000 + 10000000,
-					Counts:  0,
-					GCState: true, // todo
-				},
+			/**
+			 * The used space is the sum of the size of every object of the
+			 * bucket, which a listing already reports: no object is
+			 * downloaded to produce this figure.
+			 *
+			 * It is read asynchronously because walking a bucket takes
+			 * seconds while pvestatd, which polls this endpoint every 10
+			 * seconds, gives the whole request 7 seconds before declaring
+			 * the storage unusable. Until the first walk completes, the
+			 * placeholder below keeps the storage reported as healthy.
+			 **/
+			usage, known := datastoreUsageCache.GetAsync(ds, func() (DataStoreUsage, error) {
+				return ComputeDataStoreUsage(C, s.SecureFlag, ds)
 			})
+
+			status := DataStoreStatus{
+				Used:    10000,
+				Avail:   10000000,
+				Total:   10000 + 10000000,
+				Counts:  0,
+				GCState: true, // todo
+			}
+			if known {
+				avail := unknownDataStoreCapacity
+				if datastoreCapacity > usage.Bytes {
+					avail = datastoreCapacity - usage.Bytes
+				} else if datastoreCapacity > 0 {
+					avail = 0
+				}
+				status = DataStoreStatus{
+					Used:    int64(usage.Bytes),
+					Avail:   int64(avail),
+					Total:   int64(usage.Bytes + avail),
+					Counts:  int64(usage.Snapshots),
+					GCState: true, // todo
+				}
+			}
+
+			resp, _ := json.Marshal(Response{Data: status})
 			w.Header().Add("Content-Type", "application/json")
 			w.Write(resp)
 		}
@@ -479,7 +578,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if ns != "" {
 				s3backuplog.DebugPrint("Request for namespace: %s", ns)
 			}
-			snapshots, _ := s3pmoxcommon.ListSnapshots(*C.Client, ds, false)
+			snapshots, _ := listSnapshotsCached(C.Client, ds)
 			groups := make([]Group, 0)
 			for _, snap := range snapshots {
 				var filelist []string
@@ -494,9 +593,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					BackupType: snap.BackupType,
 					/* During proxmox-backup-manager pull the sync job expects
 					 * a size field, otherwise it assumes the backup to be active
-					 * and ignores it during sync
+					 * and ignores it during sync. The real size is used when it
+					 * is known, the historical placeholder otherwise.
 					 **/
-					Size:  200,
+					Size:  groupSize(snap.Size),
 					Owner: C.AccessKeyID + "@pbs",
 				}
 				var exists bool = false
@@ -549,7 +649,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				ss.InitWithForm(r)
 				ss.Datastore = ds
 				s3backuplog.InfoPrint("Removing snapshot: %s as requested by user", ss.S3Prefix())
+				invalidateDataStoreCaches(ds)
 				if err := ss.Delete(*C.Client); err == nil {
+					invalidateDataStoreCaches(ds)
 					w.Header().Add("Content-Type", "application/json")
 					resp, _ := json.Marshal(Response{
 						Data: ss,
@@ -574,7 +676,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				id := r.URL.Query().Get("backup-id")
 				bcktype := r.URL.Query().Get("backup-type")
 
-				snapshots, err = s3pmoxcommon.ListSnapshots(*C.Client, ds, false)
+				snapshots, err = listSnapshotsCached(C.Client, ds)
 				if err != nil {
 					w.WriteHeader(http.StatusInternalServerError)
 					io.WriteString(w, err.Error())
@@ -607,6 +709,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	/*Backup HTTP2 Api*/
 	if strings.HasPrefix(r.RequestURI, "/finish") && s.H2Ticket != nil && r.Method == "POST" {
 		s.Finished = true
+		if s.SelectedDataStore != nil {
+			// A new snapshot has just landed: let the UI see it without
+			// waiting out the listing TTL.
+			invalidateDataStoreCaches(*s.SelectedDataStore)
+		}
 	}
 	if strings.HasPrefix(r.RequestURI, "/previous_backup_time") && s.H2Ticket != nil && r.Method == "GET" {
 		mostRecent, err := s3pmoxcommon.GetLatestSnapshot(

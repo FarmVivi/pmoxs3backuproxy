@@ -55,10 +55,11 @@ type ttlCache[T any] struct {
 }
 
 type ttlCacheEntry[T any] struct {
-	mu      sync.Mutex // held while refreshing, gives the single flight
-	value   T
-	fetched time.Time
-	valid   bool
+	mu         sync.Mutex // held while refreshing, gives the single flight
+	value      T
+	fetched    time.Time
+	valid      bool
+	refreshing bool // a background refresh is in flight, see GetAsync
 }
 
 func newTTLCache[T any](ttl time.Duration) *ttlCache[T] {
@@ -110,6 +111,51 @@ func (c *ttlCache[T]) Get(key string, fetch func() (T, error)) (T, bool, error) 
 	e.fetched = time.Now()
 	e.valid = true
 	return value, true, nil
+}
+
+// GetAsync never blocks on the upstream call: it returns whatever is cached,
+// fresh or stale, and refreshes in the background when the entry is missing or
+// expired. The boolean reports whether a value was available at all.
+//
+// This is what endpoints on the critical path of PVE must use. Computing the
+// usage of a datastore means listing every object of the bucket, which takes
+// seconds on a large bucket, and pvestatd will not wait: it gives the PBS API
+// 7 seconds for the whole request. Answering with the previous value and
+// refreshing behind is the only way to expose an expensive figure without ever
+// risking that timeout.
+func (c *ttlCache[T]) GetAsync(key string, fetch func() (T, error)) (T, bool) {
+	e := c.entry(key)
+
+	e.mu.Lock()
+	if e.valid && time.Since(e.fetched) < c.ttl {
+		defer e.mu.Unlock()
+		return e.value, true
+	}
+	value, valid := e.value, e.valid
+	refreshing := e.refreshing
+	if !refreshing {
+		e.refreshing = true
+	}
+	e.mu.Unlock()
+
+	if !refreshing {
+		go func() {
+			v, err := fetch()
+
+			e.mu.Lock()
+			defer e.mu.Unlock()
+			e.refreshing = false
+			if err != nil {
+				s3backuplog.WarnPrint("Background refresh of cached entry [%s] failed: %s", key, err.Error())
+				return
+			}
+			e.value = v
+			e.fetched = time.Now()
+			e.valid = true
+		}()
+	}
+
+	return value, valid
 }
 
 // Invalidate drops the entry for key, so the next Get calls upstream again.
