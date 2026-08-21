@@ -144,3 +144,53 @@ func TestTTLCacheInvalidate(t *testing.T) {
 		t.Fatalf("after Invalidate: got (%d, %v), want (2, true)", v, fresh)
 	}
 }
+
+func TestTTLCacheExpirePreservesStaleValueDuringAsyncRefresh(t *testing.T) {
+	c := newTTLCache[int](time.Minute)
+	if _, _, err := c.Get("k", func() (int, error) { return 7, nil }); err != nil {
+		t.Fatal(err)
+	}
+	c.Expire("k")
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	v, known := c.GetAsync("k", func() (int, error) {
+		close(started)
+		<-release
+		return 8, nil
+	})
+	if v != 7 || !known {
+		t.Fatalf("during refresh: got (%d, %v), want stale (7, true)", v, known)
+	}
+	<-started
+	close(release)
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if v, ok := c.Peek("k"); ok && v == 8 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("background refresh did not replace the stale value")
+}
+
+func TestWaitForDataStoreUsage(t *testing.T) {
+	datastoreUsageCache = newTTLCache[DataStoreUsage](time.Minute)
+	want := DataStoreUsage{Bytes: 42, Objects: 3}
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		datastoreUsageCache.Get("bucket", func() (DataStoreUsage, error) { return want, nil })
+	}()
+	got, ok := waitForDataStoreUsage("bucket", time.Second)
+	if !ok || got != want {
+		t.Fatalf("got (%+v, %v), want (%+v, true)", got, ok, want)
+	}
+}
+
+func TestWaitForDataStoreUsageTimesOut(t *testing.T) {
+	datastoreUsageCache = newTTLCache[DataStoreUsage](time.Minute)
+	if _, ok := waitForDataStoreUsage("missing", 20*time.Millisecond); ok {
+		t.Fatal("missing usage unexpectedly became available")
+	}
+}

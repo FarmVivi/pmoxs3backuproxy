@@ -177,3 +177,16 @@ func (c *ttlCache[T]) Invalidate(key string) {
 	defer e.mu.Unlock()
 	e.valid = false
 }
+
+// Expire forces a refresh while preserving the last known value. This is the
+// right invalidation mode for GetAsync callers: dropping the value would make
+// a non-blocking endpoint return a placeholder until the background refresh
+// completes, which produces false monitoring samples after every mutation.
+func (c *ttlCache[T]) Expire(key string) {
+	e := c.entry(key)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.valid {
+		e.fetched = time.Time{}
+	}
+}

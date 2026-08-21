@@ -169,7 +169,7 @@ func main() {
 		"Seconds a snapshot listing is reused before listing the bucket again, 0 disables caching",
 	)
 	usageCacheTTLFlag := flag.Uint64(
-		"usagecachettl", 900,
+		"usagecachettl", 60,
 		"Seconds before the used space of a datastore is recomputed in the background",
 	)
 	datastoreSizeFlag := flag.Uint64(
@@ -207,6 +207,7 @@ func main() {
 	// An index under backups/ never changes, so its size is cached for as long
 	// as the process is expected to run between restarts.
 	archiveSizeCache = newTTLCache[uint64](24 * time.Hour)
+	manifestCryptModeCache = newTTLCache[map[string]string](24 * time.Hour)
 	usageStatsCache = newTTLCache[[]byte](5 * time.Minute)
 	datastoreCapacity = *datastoreSizeFlag
 	if !ValidSnapshotSizeMode(*snapshotSizeFlag) {
@@ -271,6 +272,7 @@ func listSnapshotsCached(c *minio.Client, datastore string) ([]s3pmoxcommon.Snap
 		if err != nil {
 			return nil, err
 		}
+		FillSnapshotCryptModes(c, s)
 		FillArchiveSizes(c, s)
 		ApplySnapshotSizeMode(snapshotSizeMode, s, readUsageStats(c, datastore))
 		return s, nil
@@ -293,7 +295,7 @@ func groupSize(size uint64) uint64 {
 // waiting out a TTL.
 func invalidateDataStoreCaches(datastore string) {
 	snapshotListCache.Invalidate(datastore)
-	datastoreUsageCache.Invalidate(datastore)
+	datastoreUsageCache.Expire(datastore)
 }
 
 // readUsageStats returns the collector report of a datastore, or nil when
@@ -431,6 +433,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ss.InitWithQuery(r.URL.Query())
 			ss.Datastore = ds
 			ss.GetFiles(*C.Client)
+			filesSnapshot := []s3pmoxcommon.Snapshot{ss}
+			FillSnapshotCryptModes(C.Client, filesSnapshot)
+			ss = filesSnapshot[0]
 			w.Header().Add("Content-Type", "application/json")
 			resp, _ := json.Marshal(Response{
 				Data: ss.Files,
@@ -564,6 +569,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			usage, known := datastoreUsageCache.GetAsync(ds, func() (DataStoreUsage, error) {
 				return ComputeDataStoreUsage(C, s.SecureFlag, ds)
 			})
+			if !known {
+				usage, known = waitForDataStoreUsage(ds, coldUsageCacheWait)
+				if !known {
+					s3backuplog.WarnPrint(
+						"Datastore [%s] usage is not available after %s; returning the startup placeholder while refresh continues",
+						ds, coldUsageCacheWait,
+					)
+				}
+			}
 
 			status := DataStoreStatus{
 				Used:    10000,
@@ -1326,9 +1340,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	/* HTTP2 Restore API */
 	if strings.HasPrefix(r.RequestURI, "/download?") && s.H2Ticket != nil {
+		if s.H2Ticket.Client == nil || s.SelectedDataStore == nil {
+			http.Error(w, "download requires an authenticated restore session", http.StatusUnauthorized)
+			return
+		}
 		blobname := r.URL.Query().Get("file-name")
+		if blobname == "" {
+			http.Error(w, "missing file-name", http.StatusBadRequest)
+			return
+		}
 		obj, err := s.H2Ticket.Client.GetObject(
-			context.Background(),
+			r.Context(),
 			*s.SelectedDataStore,
 			s.Snapshot.S3Prefix()+"/"+blobname,
 			minio.GetObjectOptions{},
@@ -1338,6 +1360,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(err.Error()))
 			return
 		}
+		defer obj.Close()
 		st, err := obj.Stat()
 		if err != nil {
 			w.WriteHeader(http.StatusNotFound)
@@ -1348,14 +1371,26 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		w.Header().Add("Content-Length", fmt.Sprintf("%d", st.Size))
 		w.WriteHeader(http.StatusOK)
-		io.Copy(w, obj)
+		if _, err := io.Copy(w, obj); err != nil {
+			s3backuplog.ErrorPrint("Restore download failed datastore=%s object=%s: %s", *s.SelectedDataStore, blobname, err)
+		}
+		return
 	}
 
 	if strings.HasPrefix(r.RequestURI, "/chunk?") && s.H2Ticket != nil {
+		if s.H2Ticket.Client == nil || s.SelectedDataStore == nil {
+			http.Error(w, "chunk download requires an authenticated restore session", http.StatusUnauthorized)
+			return
+		}
 		digest := r.URL.Query().Get("digest")
-		s3name := fmt.Sprintf("chunks/%s/%s/%s", digest[0:2], digest[2:4], digest[4:])
+		s3name, err := chunkObjectName(digest)
+		if err != nil {
+			s3backuplog.WarnPrint("Rejected invalid restore chunk request: %s", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		obj, err := s.H2Ticket.Client.GetObject(
-			context.Background(),
+			r.Context(),
 			*s.SelectedDataStore,
 			s3name,
 			minio.GetObjectOptions{},
@@ -1366,6 +1401,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			s3backuplog.ErrorPrint("%s: Critical: Missing chunk on S3 bucket: %s", digest, err.Error())
 			return
 		}
+		defer obj.Close()
 		st, err := obj.Stat()
 		if err != nil {
 			w.WriteHeader(http.StatusNotFound)
@@ -1377,7 +1413,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		w.Header().Add("Content-Length", fmt.Sprintf("%d", st.Size))
 		w.WriteHeader(http.StatusOK)
-		io.Copy(w, obj)
+		if _, err := io.Copy(w, obj); err != nil {
+			s3backuplog.ErrorPrint("Restore chunk stream failed datastore=%s digest=%s: %s", *s.SelectedDataStore, digest, err)
+		}
+		return
 	}
 
 	/* End of HTTP 2 Restore API */
@@ -1414,10 +1453,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if strings.HasPrefix(r.RequestURI, "//api2/json/backup") && auth {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "protocol upgrade is not supported by this connection", http.StatusInternalServerError)
+			return
+		}
 		w.Header().Add("Upgrade", "proxmox-backup-protocol-v1")
 		w.WriteHeader(http.StatusSwitchingProtocols)
-		hj, _ := w.(http.Hijacker)
-		conn, _, _ := hj.Hijack() //Here SSL/TCP connection is deowned from the HTTP1.1 server and passed to HTTP2 handler after sending headers telling the client that we are switching protocols
+		conn, _, err := hj.Hijack() //Here SSL/TCP connection is deowned from the HTTP1.1 server and passed to HTTP2 handler after sending headers telling the client that we are switching protocols
+		if err != nil {
+			s3backuplog.ErrorPrint("Backup protocol upgrade failed: %s", err)
+			return
+		}
 		ss := s3pmoxcommon.Snapshot{}
 		ss.InitWithQuery(r.URL.Query())
 		store := r.URL.Query().Get("store")
@@ -1434,10 +1481,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if strings.HasPrefix(r.RequestURI, "//api2/json/reader") && auth {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "protocol upgrade is not supported by this connection", http.StatusInternalServerError)
+			return
+		}
 		w.Header().Add("Upgrade", "proxmox-backup-protocol-v1")
 		w.WriteHeader(http.StatusSwitchingProtocols)
-		hj, _ := w.(http.Hijacker)
-		conn, _, _ := hj.Hijack() //Here SSL/TCP connection is deowned from the HTTP1.1 server and passed to HTTP2 handler after sending headers telling the client that we are switching protocols
+		conn, _, err := hj.Hijack() //Here SSL/TCP connection is deowned from the HTTP1.1 server and passed to HTTP2 handler after sending headers telling the client that we are switching protocols
+		if err != nil {
+			s3backuplog.ErrorPrint("Restore protocol upgrade failed: %s", err)
+			return
+		}
 		ss := s3pmoxcommon.Snapshot{}
 		ss.InitWithQuery(r.URL.Query())
 		store := r.URL.Query().Get("store")
