@@ -1,4 +1,4 @@
-FROM golang:1.26.6-bookworm AS builder
+FROM golang:1.27.0-bookworm AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -19,15 +19,14 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build tizbac/pmoxs3backuproxy/cmd/pmoxs3backuproxy
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build tizbac/pmoxs3backuproxy/cmd/garbagecollector
 
-# Both binaries are statically linked. scratch has no moving package or image
-# version to pin; copy only the CA bundle needed for HTTPS S3 endpoints.
-FROM scratch
+# The free Chainguard static image only publishes the `latest` tag. Versioned
+# tags require catalogue access, so this is the documented pinning exception.
+FROM cgr.dev/chainguard/static:latest
 
 WORKDIR /
 
 COPY --from=builder /workspace/pmoxs3backuproxy .
 COPY --from=builder /workspace/garbagecollector .
-COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 COPY server.crt /
 COPY server.key /

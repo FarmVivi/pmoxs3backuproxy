@@ -97,7 +97,7 @@ func (s *Server) backup(sock net.Conn, C TicketEntry, ds string, S s3pmoxcommon.
 			time.Since(started).Round(time.Millisecond),
 		)
 		S.Datastore = ds
-		if err := S.Delete(*C.Client); err != nil {
+		if err := S.Delete(C.Client); err != nil {
 			s3backuplog.ErrorPrint("Failed to remove incomplete backup: " + err.Error())
 		} else {
 			s3backuplog.WarnPrint("Removed incomplete backup %s", snew.Snapshot.S3Prefix())

@@ -9,8 +9,7 @@
 # About this fork
 
 This fork currently builds on upstream `v0.0.6` and adds operational and data
-safety work required by the Scipio deployment. The main differences from
-upstream are:
+safety improvements. The main differences from upstream are:
 
 - fail-closed garbage collection: complete index scanning, shared-chunk
   protection, a grace period for in-flight uploads, safer locking, corruption
@@ -28,9 +27,13 @@ upstream are:
   Dependabot updates, and narrowly scoped Renovate coverage for formats that
   Dependabot cannot parse.
 
-The fork release suffix is `-scipioN`. Read release notes and validate both a
-backup and a restore before upgrading, especially when enabling the garbage
-collector or provider lifecycle policies.
+This fork has its own Semantic Versioning sequence. Its first consolidated
+release is `v0.1.0`; fixes increment the patch version (`v0.1.1`) and new
+backward-compatible features increment the minor version (`v0.2.0`) while the
+project remains below 1.0. The upstream version used as a base is documented
+separately and is not encoded as a pre-release suffix. Read release notes and
+validate both a backup and a restore before upgrading, especially when
+enabling the garbage collector or provider lifecycle policies.
 
 <!-- START doctoc generated TOC please keep comment here to allow auto update -->
 <!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
@@ -347,7 +350,7 @@ name: pmoxs3backuproxy
 services:
   pmoxs3backuproxy:
     # renovate: datasource=docker depName=ghcr.io/farmvivi/pmoxs3backuproxy versioning=docker
-    image: ghcr.io/farmvivi/pmoxs3backuproxy:v0.0.6-scipio9
+    image: ghcr.io/farmvivi/pmoxs3backuproxy:v0.1.0
     command: -bind 127.0.0.1:8007 -endpoint 127.0.0.1:9000
     container_name: pmoxs3backuproxy
     hostname: pmoxs3backuproxy
@@ -370,7 +373,7 @@ To execute the garbage collector in a separate container, you can use a
 different entrypoint:
 ```
  # renovate: datasource=docker depName=ghcr.io/farmvivi/pmoxs3backuproxy versioning=docker
- PROXY_IMAGE=ghcr.io/farmvivi/pmoxs3backuproxy:v0.0.6-scipio9
+ PROXY_IMAGE=ghcr.io/farmvivi/pmoxs3backuproxy:v0.1.0
  docker run --entrypoint /garbagecollector -it "$PROXY_IMAGE" [..]
 ```
 or exec it within the running proxy container:

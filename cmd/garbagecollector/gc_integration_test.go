@@ -151,7 +151,7 @@ func TestIntegrationGCSweep(t *testing.T) {
 			t.Fatalf("put deletion-boundary fixture: %v", err)
 		}
 	}
-	if err := deleteTarget.Delete(*client); err != nil {
+	if err := deleteTarget.Delete(client); err != nil {
 		t.Fatalf("delete exact snapshot: %v", err)
 	}
 	if _, err := client.StatObject(ctx, bucket, similarPrefix, minio.StatObjectOptions{}); err != nil {
