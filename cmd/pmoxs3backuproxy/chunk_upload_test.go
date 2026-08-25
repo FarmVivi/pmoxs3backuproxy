@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
 const testDigest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -243,7 +245,16 @@ func TestStoreChunkPropagatesEveryFailure(t *testing.T) {
 	})
 	t.Run("short uploaded body", func(t *testing.T) {
 		store := &fakeChunkStore{}
-		if _, err := storeChunk(context.Background(), store, "bucket", requestForBody(2), strings.NewReader("x"), ""); err == nil || !strings.Contains(err.Error(), "consumed 1") {
+		if _, err := storeChunk(context.Background(), store, "bucket", requestForBody(2), strings.NewReader("x"), ""); err == nil || !strings.Contains(err.Error(), "read chunk") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if store.puts != 0 {
+			t.Fatal("a short body must never be uploaded")
+		}
+	})
+	t.Run("short uploaded body, streamed path", func(t *testing.T) {
+		store := &fakeChunkStore{}
+		if _, err := storeStreamedChunk(context.Background(), store, "bucket", requestForBody(2), strings.NewReader("x"), ""); err == nil || !strings.Contains(err.Error(), "consumed 1") {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
@@ -253,9 +264,15 @@ func TestStoreChunkPropagatesEveryFailure(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
-	t.Run("known body read error", func(t *testing.T) {
+	t.Run("body read error", func(t *testing.T) {
 		store := &fakeChunkStore{exists: true}
-		if _, err := storeChunk(context.Background(), store, "bucket", requestForBody(1), errorReader{}, ""); err == nil || !strings.Contains(err.Error(), "drain known") {
+		if _, err := storeChunk(context.Background(), store, "bucket", requestForBody(1), errorReader{}, ""); err == nil || !strings.Contains(err.Error(), "read chunk") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+	t.Run("known body read error, streamed path", func(t *testing.T) {
+		store := &fakeChunkStore{exists: true}
+		if _, err := storeStreamedChunk(context.Background(), store, "bucket", requestForBody(1), errorReader{}, ""); err == nil || !strings.Contains(err.Error(), "drain known") {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
@@ -555,4 +572,160 @@ type slowDiscardWriter struct {
 func (w slowDiscardWriter) Write(p []byte) (int, error) {
 	time.Sleep(w.delay)
 	return len(p), nil
+}
+
+// seekRecordingStore captures the reader handed to PutObject so a test can
+// assert on the property minio-go actually depends on to retry.
+type seekRecordingStore struct {
+	seekable bool
+	first    []byte
+	replayed []byte
+}
+
+func (seekRecordingStore) StatObject(
+	context.Context, string, string, minio.StatObjectOptions,
+) (minio.ObjectInfo, error) {
+	return minio.ObjectInfo{}, minio.ErrorResponse{Code: "NoSuchKey", StatusCode: http.StatusNotFound}
+}
+
+func (s *seekRecordingStore) PutObject(
+	_ context.Context,
+	_ string,
+	_ string,
+	r io.Reader,
+	size int64,
+	_ minio.PutObjectOptions,
+) (minio.UploadInfo, error) {
+	body, err := io.ReadAll(io.LimitReader(r, size))
+	if err != nil {
+		return minio.UploadInfo{}, err
+	}
+	s.first = body
+
+	seeker, ok := r.(io.Seeker)
+	s.seekable = ok
+	if !ok {
+		return minio.UploadInfo{}, nil
+	}
+	// This is exactly what minio-go does before a retry.
+	if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+		return minio.UploadInfo{}, err
+	}
+	replayed, err := io.ReadAll(io.LimitReader(r, size))
+	if err != nil {
+		return minio.UploadInfo{}, err
+	}
+	s.replayed = replayed
+	return minio.UploadInfo{}, nil
+}
+
+func TestStoreChunkHandsS3ARewindableBodySoRetriesArm(t *testing.T) {
+	store := &seekRecordingStore{}
+	body := bytes.Repeat([]byte("chunk payload "), 512)
+
+	if _, err := storeChunk(
+		context.Background(), store, "bucket", requestForBody(len(body)),
+		bytes.NewReader(body), "STANDARD_IA",
+	); err != nil {
+		t.Fatalf("storeChunk: %v", err)
+	}
+
+	if !store.seekable {
+		t.Fatal("PutObject received a body that cannot be rewound: minio-go would run a single attempt")
+	}
+	if !bytes.Equal(store.first, body) {
+		t.Fatalf("first attempt uploaded %d bytes, want %d", len(store.first), len(body))
+	}
+	if !bytes.Equal(store.replayed, body) {
+		t.Fatalf("retry would upload %d bytes, want the same %d", len(store.replayed), len(body))
+	}
+}
+
+func TestStoreChunkStreamsChunksTooLargeToBuffer(t *testing.T) {
+	store := &seekRecordingStore{}
+	size := int64(maxBufferedChunkBytes) + 1
+	request := requestForBody(0)
+	request.EncodedSize = size
+
+	if _, err := storeChunk(
+		context.Background(), store, "bucket", request,
+		io.LimitReader(neverEndingReader{}, size), "",
+	); err != nil {
+		t.Fatalf("storeChunk: %v", err)
+	}
+	if store.seekable {
+		t.Fatal("an oversized chunk must not be buffered in memory")
+	}
+	if int64(len(store.first)) != size {
+		t.Fatalf("streamed %d bytes, want %d", len(store.first), size)
+	}
+}
+
+type neverEndingReader struct{}
+
+func (neverEndingReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'z'
+	}
+	return len(p), nil
+}
+
+// TestStoreChunkRetriesAgainstAnUnreliableEndpoint drives a real minio client
+// against a server that fails the way OVH did on 2026-08-23: the first attempt
+// gets no usable response, the next one succeeds.
+func TestStoreChunkRetriesAgainstAnUnreliableEndpoint(t *testing.T) {
+	var attempts atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			// The chunk is not in the bucket yet, so the upload must happen.
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.Method == http.MethodGet {
+			// Bucket region lookup performed before the first object call.
+			w.Header().Set("Content-Type", "application/xml")
+			io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?>`+
+				`<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">us-east-1</LocationConstraint>`)
+			return
+		}
+		if r.Method != http.MethodPut {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if attempts.Add(1) == 1 {
+			io.Copy(io.Discard, r.Body)
+			w.WriteHeader(http.StatusInternalServerError)
+			io.WriteString(w, `<Error><Code>InternalError</Code></Error>`)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		w.Header().Set("ETag", fmt.Sprintf("\"%x\"", sha256.Sum256(body)))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	endpoint := strings.TrimPrefix(server.URL, "http://")
+	client, err := minio.New(endpoint, &minio.Options{
+		Creds:        credentials.NewStaticV4("key", "secret", ""),
+		Secure:       false,
+		BucketLookup: minio.BucketLookupPath,
+	})
+	if err != nil {
+		t.Fatalf("minio client: %v", err)
+	}
+
+	body := bytes.Repeat([]byte("retry me "), 1024)
+	known, err := storeChunk(
+		context.Background(), client, "bucket", requestForBody(len(body)),
+		bytes.NewReader(body), "",
+	)
+	if err != nil {
+		t.Fatalf("storeChunk should have recovered from the first failure: %v", err)
+	}
+	if known {
+		t.Fatal("chunk reported as already known")
+	}
+	if got := attempts.Load(); got < 2 {
+		t.Fatalf("endpoint saw %d PUT attempts, want the upload to be retried", got)
+	}
 }

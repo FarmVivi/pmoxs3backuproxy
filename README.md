@@ -17,6 +17,9 @@ safety improvements. The main differences from upstream are:
 - fixes and regression tests for concurrent chunk uploads, interrupted backup
   sessions, cleanup paths, chunk streaming during restore, and the HTTP/1.1 to
   HTTP/2 protocol upgrade;
+- chunk uploads that survive a transient endpoint failure: a chunk small enough
+  to buffer is sent from a rewindable reader, which is what arms the retry loop
+  minio-go already implements;
 - structured error, warning, information, and opt-in debug logs;
 - opt-in Proxmox UI reporting for datastore usage, archive sizes, encryption
   state, and GC-derived referenced/exclusive sizes;

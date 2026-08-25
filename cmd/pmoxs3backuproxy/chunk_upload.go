@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -171,7 +172,91 @@ func (r *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// maxBufferedChunkBytes caps how much of a chunk is held in memory so that the
+// upload can be retried. Proxmox chunks are at most 4 MiB before encoding, so
+// this leaves ample headroom while bounding what a client can make the proxy
+// allocate; anything larger falls back to a single streamed attempt.
+const maxBufferedChunkBytes = 16 << 20
+
 func storeChunk(
+	ctx context.Context,
+	store chunkObjectStore,
+	bucket string,
+	request chunkRequest,
+	body io.Reader,
+	storageClass string,
+) (bool, error) {
+	if request.EncodedSize <= maxBufferedChunkBytes {
+		return storeBufferedChunk(ctx, store, bucket, request, body, storageClass)
+	}
+	return storeStreamedChunk(ctx, store, bucket, request, body, storageClass)
+}
+
+// storeBufferedChunk reads the chunk into memory before talking to S3, then
+// hands minio-go an io.Seeker.
+//
+// That seeker is the whole point: minio-go retries a failed request up to
+// MaxRetry times with exponential backoff, and it classifies a response-header
+// timeout as retryable — but it arms that loop only when the request body can
+// be rewound (api.go: "Retry only when reader is seekable", otherwise
+// reqRetry = 1). Streaming the client's HTTP/2 body straight through therefore
+// gave every chunk exactly one attempt, and a single unresponsive minute at the
+// S3 endpoint cost a whole guest backup for the night.
+//
+// Retrying is safe by construction here: the object key is the digest of the
+// content, so re-sending identical bytes cannot produce a different object.
+//
+// Reading the body first also releases the HTTP/2 flow-control window before
+// the S3 round-trip instead of holding it open for its whole duration.
+func storeBufferedChunk(
+	ctx context.Context,
+	store chunkObjectStore,
+	bucket string,
+	request chunkRequest,
+	body io.Reader,
+	storageClass string,
+) (bool, error) {
+	payload := make([]byte, request.EncodedSize)
+	if _, err := io.ReadFull(body, payload); err != nil {
+		return false, fmt.Errorf(
+			"read chunk %s: %w",
+			request.Digest,
+			err,
+		)
+	}
+	if trailing, err := io.Copy(io.Discard, body); err != nil {
+		return false, fmt.Errorf("drain chunk %s: %w", request.Digest, err)
+	} else if trailing != 0 {
+		return false, fmt.Errorf(
+			"chunk %s contains %d trailing encoded bytes",
+			request.Digest,
+			trailing,
+		)
+	}
+
+	_, err := store.StatObject(ctx, bucket, request.ObjectName, minio.StatObjectOptions{})
+	if err == nil {
+		return true, nil
+	}
+	if !isObjectNotFound(err) {
+		return false, fmt.Errorf("stat chunk %s: %w", request.Digest, err)
+	}
+
+	if _, err := store.PutObject(
+		ctx,
+		bucket,
+		request.ObjectName,
+		bytes.NewReader(payload),
+		request.EncodedSize,
+		putOptions(storageClass, nil),
+	); err != nil {
+		return false, fmt.Errorf("put chunk %s: %w", request.Digest, err)
+	}
+	return false, nil
+}
+
+// storeStreamedChunk is the single-attempt path for chunks too large to buffer.
+func storeStreamedChunk(
 	ctx context.Context,
 	store chunkObjectStore,
 	bucket string,
