@@ -15,7 +15,8 @@ safety improvements. The main differences from upstream are:
   protection, a grace period for in-flight uploads, safer locking, corruption
   reporting, and usage statistics;
 - fixes and regression tests for concurrent chunk uploads, interrupted backup
-  sessions, cleanup paths, and chunk streaming during restore;
+  sessions, cleanup paths, chunk streaming during restore, and the HTTP/1.1 to
+  HTTP/2 protocol upgrade;
 - structured error, warning, information, and opt-in debug logs;
 - opt-in Proxmox UI reporting for datastore usage, archive sizes, encryption
   state, and GC-derived referenced/exclusive sizes;
