@@ -1558,14 +1558,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if strings.HasPrefix(r.RequestURI, "//api2/json/backup") && auth {
-		hj, ok := w.(http.Hijacker)
-		if !ok {
+		if _, ok := w.(http.Hijacker); !ok {
 			http.Error(w, "protocol upgrade is not supported by this connection", http.StatusInternalServerError)
 			return
 		}
 		w.Header().Add("Upgrade", "proxmox-backup-protocol-v1")
 		w.WriteHeader(http.StatusSwitchingProtocols)
-		conn, _, err := hj.Hijack() //Here SSL/TCP connection is deowned from the HTTP1.1 server and passed to HTTP2 handler after sending headers telling the client that we are switching protocols
+		//Here SSL/TCP connection is deowned from the HTTP1.1 server and passed to HTTP2 handler after sending headers telling the client that we are switching protocols
+		conn, err := hijackWithBuffered(w)
 		if err != nil {
 			s3backuplog.ErrorPrint("Backup protocol upgrade failed: %s", err)
 			return
@@ -1586,14 +1586,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if strings.HasPrefix(r.RequestURI, "//api2/json/reader") && auth {
-		hj, ok := w.(http.Hijacker)
-		if !ok {
+		if _, ok := w.(http.Hijacker); !ok {
 			http.Error(w, "protocol upgrade is not supported by this connection", http.StatusInternalServerError)
 			return
 		}
 		w.Header().Add("Upgrade", "proxmox-backup-protocol-v1")
 		w.WriteHeader(http.StatusSwitchingProtocols)
-		conn, _, err := hj.Hijack() //Here SSL/TCP connection is deowned from the HTTP1.1 server and passed to HTTP2 handler after sending headers telling the client that we are switching protocols
+		//Here SSL/TCP connection is deowned from the HTTP1.1 server and passed to HTTP2 handler after sending headers telling the client that we are switching protocols
+		conn, err := hijackWithBuffered(w)
 		if err != nil {
 			s3backuplog.ErrorPrint("Restore protocol upgrade failed: %s", err)
 			return
