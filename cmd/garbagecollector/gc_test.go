@@ -55,6 +55,32 @@ func TestListObjectsFullyRejectsPartialListing(t *testing.T) {
 	}
 }
 
+// TestListObjectsFullySkipsDirectoryMarkers covers the empty placeholder an S3
+// console writes for a "folder": it parses as neither chunk nor snapshot, and
+// letting it reach the key parsers aborted the entire run.
+func TestListObjectsFullySkipsDirectoryMarkers(t *testing.T) {
+	objects, err := listObjectsFully(context.Background(), fakeLister{objects: []minio.ObjectInfo{
+		{Key: "chunks/02/", Size: 0},
+		{Key: "chunks/02/aa" + strings.Repeat("b", 58), Size: 4096},
+		{Key: "backups/", Size: 0},
+	}}, "bucket", minio.ListObjectsOptions{})
+	if err != nil {
+		t.Fatalf("listing failed: %v", err)
+	}
+	if len(objects) != 1 || objects[0].Key != "chunks/02/aa"+strings.Repeat("b", 58) {
+		t.Fatalf("directory markers were not skipped: %+v", objects)
+	}
+
+	// A zero-byte object that is NOT a marker still goes through: it is real
+	// corruption, and the key parsers must keep the chance to refuse it.
+	objects, err = listObjectsFully(context.Background(), fakeLister{objects: []minio.ObjectInfo{
+		{Key: "chunks/02/truncated", Size: 0},
+	}}, "bucket", minio.ListObjectsOptions{})
+	if err != nil || len(objects) != 1 {
+		t.Fatalf("empty non-marker object was dropped: %+v (err %v)", objects, err)
+	}
+}
+
 func makeIndex(t *testing.T, dynamic bool, digests ...[32]byte) ([]byte, string) {
 	t.Helper()
 	recordSize := 32

@@ -11,6 +11,7 @@ import (
 	"math"
 	"strings"
 	"time"
+	"tizbac/pmoxs3backuproxy/internal/s3backuplog"
 	"tizbac/pmoxs3backuproxy/internal/s3pmoxcommon"
 
 	"github.com/minio/minio-go/v7"
@@ -29,6 +30,17 @@ type objectTagReader interface {
 	GetObjectTagging(context.Context, string, string, minio.GetObjectTaggingOptions) (*tags.Tags, error)
 }
 
+// isDirectoryMarker reports whether an object is the empty placeholder an S3
+// browser writes when someone "creates a folder".
+//
+// S3 has no directories, so consoles emulate them with a zero-byte object whose
+// key ends in a slash. Such a key can never be a snapshot, an index or a chunk,
+// and refusing to parse it would abort the whole run: one click in a web
+// console would stop garbage collection until a human noticed.
+func isDirectoryMarker(object minio.ObjectInfo) bool {
+	return object.Size == 0 && strings.HasSuffix(object.Key, "/")
+}
+
 func listObjectsFully(
 	ctx context.Context,
 	store objectLister,
@@ -39,6 +51,10 @@ func listObjectsFully(
 	for object := range store.ListObjects(ctx, bucket, opts) {
 		if object.Err != nil {
 			return nil, fmt.Errorf("list %q under prefix %q: %w", bucket, opts.Prefix, object.Err)
+		}
+		if isDirectoryMarker(object) {
+			s3backuplog.DebugPrint("Ignoring directory marker %s", object.Key)
+			continue
 		}
 		objects = append(objects, object)
 	}
