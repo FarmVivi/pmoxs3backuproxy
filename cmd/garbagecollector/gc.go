@@ -337,16 +337,20 @@ func buildGCPlan(
 	return plan, nil
 }
 
+// loadIndexFromS3 downloads an index object and validates it against the csum
+// stored in its user metadata.
+//
+// The metadata is taken from the listing when the backend supplied it, and
+// otherwise from the GET response itself: a GET carries the same x-amz-meta-*
+// headers as a HEAD, and minio-go caches them, so Stat() after the body has
+// been read is served from memory. Backends without the MinIO 
+// listing extension therefore cost one request per index here instead of two.
 func loadIndexFromS3(
 	ctx context.Context,
 	client *minio.Client,
 	bucket string,
 	object minio.ObjectInfo,
 ) (parsedIndex, error) {
-	checksum, err := getObjectMetadata(ctx, bucket, object, client)
-	if err != nil {
-		return parsedIndex{}, err
-	}
 	reader, err := client.GetObject(ctx, bucket, object.Key, minio.GetObjectOptions{})
 	if err != nil {
 		return parsedIndex{}, fmt.Errorf("get index %s: %w", object.Key, err)
@@ -356,5 +360,20 @@ func loadIndexFromS3(
 	if err != nil {
 		return parsedIndex{}, fmt.Errorf("read index %s: %w", object.Key, err)
 	}
+
+	checksum := checksumFromMetadata(object)
+	if checksum == "" {
+		// Stat() must come after the body has been read: on an untouched
+		// object minio-go answers it with a separate StatObject call.
+		info, statErr := reader.Stat()
+		if statErr != nil {
+			return parsedIndex{}, fmt.Errorf("stat index %s: %w", object.Key, statErr)
+		}
+		checksum = checksumFromMetadata(info)
+	}
+	if checksum == "" {
+		return parsedIndex{}, fmt.Errorf("%s: object has no csum metadata flag set", object.Key)
+	}
+
 	return parseIndex(object.Key, data, checksum)
 }

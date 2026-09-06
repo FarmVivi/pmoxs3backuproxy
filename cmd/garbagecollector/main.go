@@ -44,25 +44,53 @@ func compareSum(csum []byte, index []byte, metadatasum string) error {
 	return nil
 }
 
-func getObjectMetadata(ctx context.Context, bucketFlag string, object minio.ObjectInfo, minioClient *minio.Client) (string, error) {
-	s3backuplog.DebugPrint("User Metadata content: [%s]", object.UserMetadata)
-	csum := object.UserMetadata["X-Amz-Meta-Csum"]
-	if csum == "" {
-		s3backuplog.WarnPrint("No metadata found for %s, retry with StatObject", object.Key)
-
-		statObject, err := minioClient.StatObject(ctx, bucketFlag, object.Key, minio.StatObjectOptions{})
-		if err != nil {
-			return "", fmt.Errorf("%s: unable to stat object: %w", object.Key, err)
+// checksumFromMetadata reads the csum user metadata out of an ObjectInfo.
+//
+// The key depends on where the ObjectInfo comes from: a listing reports the
+// raw header name, while ToObjectInfo (GET and HEAD responses) strips the
+// x-amz-meta- prefix. Accept both rather than making callers care.
+func checksumFromMetadata(info minio.ObjectInfo) string {
+	for _, key := range []string{"X-Amz-Meta-Csum", "Csum"} {
+		if csum := info.UserMetadata[key]; csum != "" {
+			return csum
 		}
-		s3backuplog.DebugPrint("StatObject User Metadata content: [%s]", statObject.UserMetadata)
-		csum = statObject.UserMetadata["Csum"]
+	}
+	return ""
+}
+
+// getObjectMetadata returns the csum user metadata of an object, falling back
+// to a HEAD request when the listing did not carry it.
+//
+// WithMetadata listings are a MinIO server extension (`metadata=true`): every
+// other S3 implementation silently ignores the parameter and answers without
+// user metadata, so the fallback is the normal path there, not an anomaly. The
+// second return value reports whether it was taken, so the caller can account
+// for the extra round trips once per run instead of logging one line per
+// object.
+func getObjectMetadata(
+	ctx context.Context,
+	bucketFlag string,
+	object minio.ObjectInfo,
+	minioClient *minio.Client,
+) (string, bool, error) {
+	s3backuplog.DebugPrint("User Metadata content: [%s]", object.UserMetadata)
+	if csum := checksumFromMetadata(object); csum != "" {
+		return csum, false, nil
 	}
 
+	s3backuplog.DebugPrint("No metadata found for %s in listing, falling back to StatObject", object.Key)
+	statObject, err := minioClient.StatObject(ctx, bucketFlag, object.Key, minio.StatObjectOptions{})
+	if err != nil {
+		return "", true, fmt.Errorf("%s: unable to stat object: %w", object.Key, err)
+	}
+	s3backuplog.DebugPrint("StatObject User Metadata content: [%s]", statObject.UserMetadata)
+
+	csum := checksumFromMetadata(statObject)
 	if csum == "" {
-		return "", fmt.Errorf("%s: object has no csum metadata flag set", object.Key)
+		return "", true, fmt.Errorf("%s: object has no csum metadata flag set", object.Key)
 	}
 
-	return csum, nil
+	return csum, true, nil
 }
 
 // withinGracePeriod reports whether an unreferenced chunk is too young to be
@@ -206,6 +234,10 @@ func main() {
 		s3backuplog.FatalPrint("Unable to verify snapshot protection; nothing was deleted: %s", err)
 	}
 
+	// Counted rather than logged per object: on a backend without the MinIO
+	// listing extension every single index takes the fallback, which used to
+	// bury the run in thousands of identical warnings.
+	statFallbacks := 0
 	plan, err := buildGCPlan(
 		ctx,
 		snapshots,
@@ -219,11 +251,22 @@ func main() {
 			return loadIndexFromS3(ctx, minioClient, *bucketFlag, object)
 		},
 		func(ctx context.Context, object minio.ObjectInfo) (string, error) {
-			return getObjectMetadata(ctx, *bucketFlag, object, minioClient)
+			csum, fellBack, err := getObjectMetadata(ctx, *bucketFlag, object, minioClient)
+			if fellBack {
+				statFallbacks++
+			}
+			return csum, err
 		},
 	)
 	if err != nil {
 		s3backuplog.FatalPrint("Garbage-collection mark phase failed; nothing was deleted: %s", err)
+	}
+	if statFallbacks > 0 {
+		s3backuplog.InfoPrint(
+			"%d copied indexes carried no metadata in the listing and were resolved with StatObject; "+
+				"the endpoint does not implement the MinIO metadata listing extension",
+			statFallbacks,
+		)
 	}
 
 	// Missing referenced chunks mean the inventory is corrupt or inconsistent.
