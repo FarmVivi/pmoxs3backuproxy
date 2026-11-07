@@ -4,10 +4,12 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     env:
-      # renovate: datasource=docker depName=minio/minio versioning=regex:^RELEASE\.(?<major>\d{4})-(?<minor>\d{2})-(?<patch>\d{2})T(?<build>\d{2})-(?<revision>\d{2})-\d{2}Z$
-      MINIO_IMAGE: minio/minio:RELEASE.2025-09-07T16-13-09Z
-      # renovate: datasource=docker depName=minio/mc versioning=regex:^RELEASE\.(?<major>\d{4})-(?<minor>\d{2})-(?<patch>\d{2})T(?<build>\d{2})-(?<revision>\d{2})-\d{2}Z$
-      MINIO_MC_IMAGE: minio/mc:RELEASE.2025-08-13T08-35-41Z
+      # MinIO no longer publishes images (minio/minio and minio/mc were removed
+      # from Docker Hub); pgsty maintains a drop-in community build.
+      # renovate: datasource=docker depName=pgsty/minio versioning=regex:^RELEASE\.(?<major>\d{4})-(?<minor>\d{2})-(?<patch>\d{2})T(?<build>\d{2})-(?<revision>\d{2})-\d{2}Z$
+      MINIO_IMAGE: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+      # renovate: datasource=docker depName=pgsty/mc versioning=regex:^RELEASE\.(?<major>\d{4})-(?<minor>\d{2})-(?<patch>\d{2})T(?<build>\d{2})-(?<revision>\d{2})-\d{2}Z$
+      MINIO_MC_IMAGE: pgsty/mc:RELEASE.2026-10-26T00-00-00Z
       # renovate: datasource=deb depName=proxmox-backup-client
       PROXMOX_BACKUP_CLIENT_VERSION: 3.4.7-1
       # renovate: datasource=deb depName=libproxmox-backup-qemu0-dev
