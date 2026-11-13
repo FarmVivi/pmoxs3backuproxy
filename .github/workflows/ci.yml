@@ -9,7 +9,7 @@ jobs:
       # renovate: datasource=docker depName=pgsty/minio versioning=regex:^RELEASE\.(?<major>\d{4})-(?<minor>\d{2})-(?<patch>\d{2})T(?<build>\d{2})-(?<revision>\d{2})-\d{2}Z$
       MINIO_IMAGE: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
       # renovate: datasource=docker depName=pgsty/mc versioning=regex:^RELEASE\.(?<major>\d{4})-(?<minor>\d{2})-(?<patch>\d{2})T(?<build>\d{2})-(?<revision>\d{2})-\d{2}Z$
-      MINIO_MC_IMAGE: pgsty/mc:RELEASE.2026-10-26T00-00-00Z
+      MINIO_MC_IMAGE: pgsty/mc:RELEASE.2026-11-12T00-00-00Z
       # renovate: datasource=deb depName=proxmox-backup-client
       PROXMOX_BACKUP_CLIENT_VERSION: 3.4.7-1
       # renovate: datasource=deb depName=libproxmox-backup-qemu0-dev
