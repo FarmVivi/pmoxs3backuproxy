@@ -8,7 +8,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/juju/clock v1.1.1
 	github.com/juju/mutex/v2 v2.0.0
-	github.com/klauspost/compress v1.20.3
+	github.com/klauspost/compress v1.20.4
 	github.com/minio/minio-go/v7 v7.4.1
 	github.com/schollz/progressbar/v3 v3.19.1
 	golang.org/x/net v0.62.0
